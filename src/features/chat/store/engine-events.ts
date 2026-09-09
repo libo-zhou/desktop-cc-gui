@@ -378,16 +378,28 @@ export function handleEngineEvents(
     const state = deps.get();
     let key = runRouting.get(event.runId);
     if (!key && event.sessionId) {
-      key = sessionKey(event.engine, event.sessionId, "");
-      // sessionId-only key lacks workspace; find active match
-      if (!(key in state.bySession)) {
-        const match = Object.keys(state.bySession).find(
-          (k) => k === key || k.endsWith(`/${event.sessionId}`),
-        );
-        if (match) key = match;
+      const sessionKeyFromEvent = sessionKey(event.engine, event.sessionId, "");
+      // A run id is the authoritative routing key. Session-id fallback is
+      // only for a currently live session whose start acknowledgement raced
+      // the first event; accepting it for a settled session lets delayed
+      // stdout resurrect output after the user pressed Stop.
+      if (state.bySession[sessionKeyFromEvent]?.streaming) {
+        key = sessionKeyFromEvent;
       }
     }
     if (!key) continue;
+
+    const session = state.bySession[key];
+    // `taskkill` and stdout pipes are asynchronous on Windows. Once Stop
+    // has been requested, discard every late content/progress event and let
+    // only a terminal event clean the backend route up.
+    if (
+      session?.interrupted &&
+      event.kind !== "done" &&
+      event.kind !== "error"
+    ) {
+      continue;
+    }
 
     switch (event.kind) {
       case "delta":

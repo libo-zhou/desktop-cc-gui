@@ -340,7 +340,10 @@ impl ProcessRegistry {
         }
     }
 
-    pub fn kill(&self, key: &str) -> bool {
+    /// Ask the OS to terminate the whole CLI process tree and wait until the
+    /// request is accepted. Returning `Ok(true)` means the OS confirmed the
+    /// termination command; `Ok(false)` means no live run matched the key.
+    pub async fn kill(&self, key: &str) -> Result<bool, String> {
         let entry = match self.0.lock() {
             Ok(map) => map
                 .get(key)
@@ -357,25 +360,29 @@ impl ProcessRegistry {
             })
         });
         let Some((pid, child, killed)) = entry else {
-            return false;
+            return Ok(false);
         };
-        killed.store(true, std::sync::atomic::Ordering::SeqCst);
         if let Ok(mut guard) = child.try_lock() {
-            // Pid-reuse guard: a reaped child's pid may already belong to
-            // someone else — never signal a group we no longer own.
-            match guard.try_wait() {
-                Ok(Some(_)) => {}
-                _ => {
-                    kill_process_group(pid);
-                    let _ = guard.start_kill();
-                }
+            // Pid-reuse guard: once a child was reaped, its OS pid may have
+            // been assigned to another process. A completed run is already
+            // stopped, so never pass that pid to taskkill.
+            if matches!(guard.try_wait(), Ok(Some(_))) {
+                return Ok(true);
             }
-        } else {
-            // The runner holds the lock only while reaping post-EOF; that
-            // window is tiny and the kill flag already settles the turn.
-            kill_process_group(pid);
         }
-        true
+        killed.store(true, std::sync::atomic::Ordering::SeqCst);
+        if terminate_process_tree(pid).await.is_ok() {
+            return Ok(true);
+        }
+
+        // Do not report a successful stop when Windows rejects `taskkill`.
+        // Best-effort kill the direct child, then let the frontend show an
+        // actionable error because grandchildren may still be alive.
+        killed.store(false, std::sync::atomic::Ordering::SeqCst);
+        if let Ok(mut guard) = child.try_lock() {
+            let _ = guard.start_kill();
+        }
+        Err("failed to terminate the CLI process tree".to_string())
     }
 
     pub fn kill_all(&self) {
@@ -437,6 +444,51 @@ pub(crate) fn kill_process_group(pid: u32) {
         command.creation_flags(CREATE_NO_WINDOW);
     }
     let _ = command.spawn();
+}
+
+/// Confirm a user-requested process-tree termination. Shutdown cleanup uses
+/// the non-blocking helper above; the interactive Stop action needs a result
+/// so the UI never claims success when `taskkill` was rejected.
+#[cfg(unix)]
+async fn terminate_process_tree(pid: u32) -> Result<(), String> {
+    // SAFETY: signal only the process group created for this child at spawn.
+    let result = unsafe { libc::kill(-(pid as i32), libc::SIGKILL) };
+    if result == 0 {
+        return Ok(());
+    }
+    let error = std::io::Error::last_os_error();
+    // A concurrent clean exit is equivalent to a successful stop.
+    if error.raw_os_error() == Some(libc::ESRCH) {
+        return Ok(());
+    }
+    Err(format!("failed to terminate the CLI process tree: {error}"))
+}
+
+#[cfg(not(unix))]
+async fn terminate_process_tree(pid: u32) -> Result<(), String> {
+    let mut command = Command::new("taskkill");
+    command
+        .args(["/PID", &pid.to_string(), "/T", "/F"])
+        .stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::null())
+        .stderr(std::process::Stdio::null());
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        command
+            .as_std_mut()
+            .creation_flags(CREATE_NO_WINDOW);
+    }
+    let status = command
+        .status()
+        .await
+        .map_err(|error| format!("failed to run taskkill: {error}"))?;
+    if status.success() {
+        Ok(())
+    } else {
+        Err(format!("taskkill exited with status {status}"))
+    }
 }
 
 // ==================== stderr redaction ====================
@@ -805,6 +857,12 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
             Ok(_) => {}
             Err(_) => break,
         }
+        // A child can leave already-written bytes in stdout after Stop. Do
+        // not turn those stale bytes into frontend events while taskkill is
+        // still tearing down the Windows process tree.
+        if ctx.killed.load(std::sync::atomic::Ordering::SeqCst) {
+            break;
+        }
         let trimmed = line.trim();
         if trimmed.is_empty() {
             continue;
@@ -813,6 +871,9 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         let mut events = Vec::new();
         ctx.engine_impl.parse_line(trimmed, &mut events);
         for event in events {
+            if ctx.killed.load(std::sync::atomic::Ordering::SeqCst) {
+                break;
+            }
             ctx.dispatch_event(&mut state, event);
         }
     }
@@ -991,8 +1052,11 @@ pub async fn send_message(
 }
 
 #[tauri::command]
-pub fn interrupt_session(state: tauri::State<'_, crate::AppState>, session_id: String) -> bool {
-    state.processes.kill(&session_id)
+pub async fn interrupt_session(
+    state: tauri::State<'_, crate::AppState>,
+    session_id: String,
+) -> Result<bool, String> {
+    state.processes.kill(&session_id).await
 }
 
 #[cfg(test)]

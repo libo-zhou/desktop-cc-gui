@@ -226,7 +226,9 @@ sleep 60
         tokio::time::sleep(std::time::Duration::from_millis(50)).await;
     }
 
-    let killed = engine::interrupt_session(app.state::<AppState>(), "fake-hang-1".to_string());
+    let killed = engine::interrupt_session(app.state::<AppState>(), "fake-hang-1".to_string())
+        .await
+        .expect("interrupt IPC must confirm process-tree termination");
     assert!(killed, "interrupt must find and kill the child");
 
     // Child exits shortly after start_kill.

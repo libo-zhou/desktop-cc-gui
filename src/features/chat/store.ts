@@ -1193,7 +1193,9 @@ export const useChatStore = create<ChatStore>((set, get) => {
       // Settle locally FIRST: the killed run's done event can arrive while
       // the kill IPCs below are still in flight, and onDone drains the queue
       // whenever interrupted is still false — that would fire the next
-      // queued message right after the user pressed stop.
+      // queued message right after the user pressed stop. Keep `streaming`
+      // true until the backend confirms termination so the composer cannot
+      // start a competing turn in this short window.
       const pending = drainPending(key);
       set((s) => {
         const cur = s.bySession[key] ?? EMPTY_SESSION;
@@ -1208,30 +1210,53 @@ export const useChatStore = create<ChatStore>((set, get) => {
             [key]: {
               ...cur,
               messages,
-              streaming: false,
+              streaming: true,
               interrupted: true,
-              turnStartedAt: null,
             },
           },
-          streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
+          streamingByKey: setStreamingFlag(s.streamingByKey, key, true),
         };
       });
       // Registry is keyed by native session id once known; before that the
-      // run id routes. Try both.
-      if (active.sessionId)
-        await ipc.interruptSession(active.sessionId).catch(() => false);
+      // run id routes. Try both, but only report Stop as completed after the
+      // backend confirms at least one process-tree termination.
+      const targets = new Set<string>();
+      if (active.sessionId) targets.add(active.sessionId);
       const deadRunIds: string[] = [];
       for (const [runId, routed] of runRouting) {
-        if (routed === key) deadRunIds.push(runId);
+        if (routed === key) {
+          deadRunIds.push(runId);
+          targets.add(runId);
+        }
       }
-      // Independent kills, one IPC call per routed run — fired together.
-      await Promise.all(
-        deadRunIds.map((runId) =>
-          ipc.interruptSession(runId).catch(() => false),
+      const results = await Promise.all(
+        [...targets].map((target) =>
+          ipc.interruptSession(target).catch(() => false),
         ),
       );
-      // The runs are dead: drop their routing entries so the map cannot grow
-      // forever. (A late done event would also remove them.)
+      if (!results.some(Boolean)) {
+        // The child can finish naturally between the click and the IPC
+        // handler. Its terminal event already settled the session, so do not
+        // resurrect a running state merely because the registry is empty.
+        if (!get().bySession[key]?.streaming) return;
+        patchSession(set, key, {
+          error: "Unable to confirm that the CLI process stopped. Please try Stop again.",
+          interrupted: false,
+          streaming: true,
+        });
+        return;
+      }
+      // The OS accepted termination: hide the running state and drop routes
+      // immediately. A late done event is harmless, while content events are
+      // fenced in engine-events.ts.
+      patchSession(set, key, {
+        interrupted: true,
+        streaming: false,
+        turnStartedAt: null,
+      });
+      set((s) => ({
+        streamingByKey: setStreamingFlag(s.streamingByKey, key, false),
+      }));
       for (const runId of deadRunIds) runRouting.delete(runId);
     },
 

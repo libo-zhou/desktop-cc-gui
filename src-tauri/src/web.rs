@@ -688,10 +688,11 @@ async fn dispatch(app: &tauri::AppHandle, cmd: &str, raw: Value) -> Result<Value
         }
         "interrupt_session" => {
             let a: SessionIdArgs = parse_args(&raw)?;
-            ser(Ok(crate::engine::interrupt_session(
+            ser(crate::engine::interrupt_session(
                 app.state(),
                 a.session_id,
-            )))
+            )
+            .await)
         }
         "list_engines" => ser(Ok(crate::engine::list_engines())),
         "list_engine_models" => {
