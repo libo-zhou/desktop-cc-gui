@@ -16,7 +16,10 @@ use serde::Serialize;
 use serde_json::Value;
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::process::ExitStatus;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
+use std::time::Duration;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::process::{Child, ChildStderr, ChildStdout, Command};
 use tokio::sync::Mutex as TokioMutex;
@@ -970,8 +973,23 @@ impl RunContext {
 
 /// Read NDJSON stdout until EOF, dispatch events, then settle the turn:
 /// registry cleanup, temp-file cleanup, and the terminal done/error event.
-async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
-    let mut state = TurnState::new(ctx.preassigned_session_id.clone());
+///
+/// Settling must never depend on stdout EOF alone: on Windows any process in
+/// the spawn chain (cmd shim → node launcher → CLI) or a helper the CLI
+/// spawned can inherit the pipe's write handle and outlive the turn, so EOF
+/// never arrives and the UI would stay "running" forever. `exit_watchdog`
+/// therefore force-settles once the direct child is gone; whichever of the
+/// two observes the settled flag first wins, the other becomes a no-op.
+async fn run_reader(stdout: ChildStdout, ctx: Arc<RunContext>) {
+    let state: SharedTurnState = Arc::new(Mutex::new(TurnState::new(
+        ctx.preassigned_session_id.clone(),
+    )));
+    let settled = Arc::new(AtomicBool::new(false));
+    tokio::spawn(exit_watchdog(
+        Arc::clone(&ctx),
+        Arc::clone(&state),
+        Arc::clone(&settled),
+    ));
     let mut reader = BufReader::new(stdout);
     let mut line = String::new();
     loop {
@@ -985,6 +1003,7 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         if trimmed.is_empty() {
             continue;
         }
+        let mut state = state.lock();
         state.saw_any_output = true;
         let mut events = Vec::new();
         ctx.engine_impl.parse_line(trimmed, &mut events);
@@ -998,6 +1017,31 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         let mut guard = ctx.child.lock().await;
         guard.wait().await.ok()
     };
+    if !settled.swap(true, Ordering::SeqCst) {
+        settle_exit(&ctx, &state, status);
+    }
+}
+
+/// Per-run streaming state shared between [`run_reader`] and
+/// [`exit_watchdog`]. parking_lot: a reader panic mid-line must not poison
+/// the lock — the watchdog still has to settle the turn afterwards. Only
+/// brief uncontended locks: the reader holds it per line, the watchdog only
+/// inside `settle_exit`.
+type SharedTurnState = Arc<parking_lot::Mutex<TurnState>>;
+
+/// How long the exit watchdog waits after the child's exit before
+/// force-settling. The normal reader path observes stdout EOF within
+/// milliseconds of the child dying — the grace only has to cover draining
+/// whatever the CLI already wrote into the pipe, so a few seconds is
+/// generous even on slow machines.
+const EXIT_SETTLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Settle the turn after the direct child exited: temp-file and registry
+/// cleanup, stderr surfacing, and exactly one terminal done/error event.
+/// Called by whichever of the reader and the exit watchdog wins the
+/// `settled` flag; never runs twice.
+fn settle_exit(ctx: &RunContext, state: &SharedTurnState, status: Option<ExitStatus>) {
+    let mut state = state.lock();
     for path in &ctx.cleanup_files {
         let _ = std::fs::remove_file(path);
     }
@@ -1029,7 +1073,7 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
     }
 
     if !state.saw_done && !state.saw_error {
-        let killed = ctx.killed.load(std::sync::atomic::Ordering::SeqCst);
+        let killed = ctx.killed.load(Ordering::SeqCst);
         if killed {
             // User-initiated stop: commit whatever streamed so far as a
             // normal turn end — a SIGKILL'd child is not a failure.
@@ -1070,6 +1114,23 @@ async fn run_reader(stdout: ChildStdout, ctx: RunContext) {
         }
     }
     ctx.sink.flush();
+}
+
+/// Force-settle a run whose stdout never reached EOF. The direct child
+/// exiting IS the turn's end — a CLI that finished its work must never leave
+/// the session wedged in "running" (nor its registry entry pin a concurrency
+/// slot) because a surviving pipe holder blocks EOF. Wait one grace period
+/// so the normal reader path wins the race when EOF does arrive, then
+/// settle; the losing reader's eventual EOF becomes a no-op.
+async fn exit_watchdog(ctx: Arc<RunContext>, state: SharedTurnState, settled: Arc<AtomicBool>) {
+    let status = {
+        let mut guard = ctx.child.lock().await;
+        guard.wait().await.ok()
+    };
+    tokio::time::sleep(EXIT_SETTLE_GRACE).await;
+    if !settled.swap(true, Ordering::SeqCst) {
+        settle_exit(&ctx, &state, status);
+    }
 }
 
 #[tauri::command]
@@ -1165,7 +1226,7 @@ pub async fn send_message(
     );
 
     let stderr_buf = spawn_stderr_capture(stderr);
-    let ctx = RunContext {
+    let ctx = Arc::new(RunContext {
         sink: Arc::clone(&state.sink),
         registry: Arc::clone(&state.processes),
         engine_impl: launch.engine_impl,
@@ -1177,8 +1238,8 @@ pub async fn send_message(
         killed,
         cleanup_files: launch.built.cleanup_files,
         stderr_buf,
-    };
-    tokio::spawn(run_reader(stdout, ctx));
+    });
+    tokio::spawn(run_reader(stdout, Arc::clone(&ctx)));
 
     Ok(SendResult {
         run_id,
@@ -1470,5 +1531,182 @@ mod tool_args_tests {
             EngineEvent::Message { patch, .. } => assert!(patch),
             _ => panic!("expected patch"),
         }
+    }
+}
+
+/// Decision table of `settle_exit` plus the reader's end-to-end wiring.
+#[cfg(test)]
+mod settle_exit_tests {
+    use super::*;
+    use crate::event_sink::Emit;
+
+    /// Captures every flushed sink payload for assertions.
+    #[derive(Default)]
+    struct CapturingEmit(parking_lot::Mutex<Vec<String>>);
+
+    impl Emit for CapturingEmit {
+        fn emit_json(&self, _name: &str, raw_json: &str) {
+            self.0.lock().push(raw_json.to_string());
+        }
+    }
+
+    fn quick_child(exit_code: i32) -> Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/c").arg(format!("exit {exit_code}"));
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg(format!("exit {exit_code}"));
+            c
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null());
+        command.spawn().expect("spawn quick child")
+    }
+
+    /// A one-line stdout producer whose output is a codex turn.completed
+    /// event: the reader path parses it, marks saw_done, and settles.
+    fn echo_done_child() -> Child {
+        #[cfg(windows)]
+        let mut command = {
+            let mut c = tokio::process::Command::new("cmd");
+            c.arg("/c").arg("echo {\"type\":\"turn.completed\"}");
+            c
+        };
+        #[cfg(not(windows))]
+        let mut command = {
+            let mut c = tokio::process::Command::new("sh");
+            c.arg("-c").arg("echo '{\"type\":\"turn.completed\"}'");
+            c
+        };
+        command
+            .stdin(std::process::Stdio::null())
+            .stdout(std::process::Stdio::piped())
+            .stderr(std::process::Stdio::null());
+        command.spawn().expect("spawn echo child")
+    }
+
+    fn test_ctx(captures: Arc<CapturingEmit>, child: Child) -> Arc<RunContext> {
+        Arc::new(RunContext {
+            sink: event_sink::EventSink::new(captures),
+            registry: Arc::new(ProcessRegistry::default()),
+            engine_impl: Box::new(codex::CodexEngine),
+            engine_id: "codex".to_string(),
+            run_id: "run-1".to_string(),
+            pid: child.id().unwrap_or(0),
+            preassigned_session_id: None,
+            child: Arc::new(TokioMutex::new(child)),
+            killed: Arc::new(AtomicBool::new(false)),
+            cleanup_files: Vec::new(),
+            stderr_buf: Arc::new(Mutex::new(String::new())),
+        })
+    }
+
+    fn kinds(captures: &CapturingEmit) -> Vec<String> {
+        captures
+            .0
+            .lock()
+            .iter()
+            .filter_map(|raw| serde_json::from_str::<Value>(raw).ok())
+            .flat_map(|value| -> Vec<String> {
+                let Some(events) = value.as_array() else {
+                    return Vec::new();
+                };
+                events
+                    .iter()
+                    .filter_map(|event| {
+                        event
+                            .get("kind")
+                            .and_then(Value::as_str)
+                            .map(str::to_string)
+                    })
+                    .collect()
+            })
+            .collect()
+    }
+
+    #[tokio::test]
+    async fn clean_exit_without_done_pushes_done() {
+        let captures = Arc::new(CapturingEmit::default());
+        let ctx = test_ctx(Arc::clone(&captures), quick_child(0));
+        let status = {
+            let mut guard = ctx.child.lock().await;
+            guard.wait().await.ok()
+        };
+        let state: SharedTurnState = Arc::new(parking_lot::Mutex::new(TurnState::new(None)));
+        settle_exit(&ctx, &state, status);
+        assert_eq!(kinds(&captures), vec!["done".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn failed_exit_pushes_error() {
+        let captures = Arc::new(CapturingEmit::default());
+        let ctx = test_ctx(Arc::clone(&captures), quick_child(3));
+        let status = {
+            let mut guard = ctx.child.lock().await;
+            guard.wait().await.ok()
+        };
+        let state: SharedTurnState = Arc::new(parking_lot::Mutex::new(TurnState::new(None)));
+        settle_exit(&ctx, &state, status);
+        assert_eq!(kinds(&captures), vec!["error".to_string()]);
+    }
+
+    #[tokio::test]
+    async fn already_done_state_pushes_no_terminal_event() {
+        let captures = Arc::new(CapturingEmit::default());
+        let ctx = test_ctx(Arc::clone(&captures), quick_child(0));
+        let status = {
+            let mut guard = ctx.child.lock().await;
+            guard.wait().await.ok()
+        };
+        let state: SharedTurnState = Arc::new(parking_lot::Mutex::new(TurnState::new(None)));
+        state.lock().saw_done = true;
+        settle_exit(&ctx, &state, status);
+        assert!(kinds(&captures).is_empty());
+    }
+
+    #[tokio::test]
+    async fn killed_run_commits_as_done() {
+        let captures = Arc::new(CapturingEmit::default());
+        let ctx = test_ctx(Arc::clone(&captures), quick_child(0));
+        ctx.killed.store(true, Ordering::SeqCst);
+        let status = {
+            let mut guard = ctx.child.lock().await;
+            guard.wait().await.ok()
+        };
+        let state: SharedTurnState = Arc::new(parking_lot::Mutex::new(TurnState::new(None)));
+        settle_exit(&ctx, &state, status);
+        assert_eq!(kinds(&captures), vec!["done".to_string()]);
+    }
+
+    /// End-to-end: the reader parses the child's terminal line (done pushed
+    /// from `turn.completed`), settles at EOF without duplicating the
+    /// terminal event, and drains the registry entry.
+    #[tokio::test]
+    async fn run_reader_settles_once_and_drains_registry() {
+        let captures = Arc::new(CapturingEmit::default());
+        let ctx = test_ctx(Arc::clone(&captures), echo_done_child());
+        ctx.registry.insert(
+            "run-1".to_string(),
+            ChildEntry {
+                child: Arc::clone(&ctx.child),
+                pid: ctx.pid,
+                run_id: "run-1".to_string(),
+                killed: Arc::clone(&ctx.killed),
+            },
+        );
+        let stdout = {
+            let mut guard = ctx.child.lock().await;
+            guard.stdout.take().expect("stdout piped")
+        };
+        run_reader(stdout, Arc::clone(&ctx)).await;
+        assert_eq!(kinds(&captures), vec!["done".to_string()]);
+        assert_eq!(ctx.registry.len(), 0);
     }
 }
