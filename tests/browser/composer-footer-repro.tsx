@@ -42,8 +42,30 @@ const ACTIVE = { engine: "claude", sessionId: "s-1", workspacePath: ROOT };
 
 function Fixture() {
   const [draft, setDraft] = useState("");
+  const [sentMessages, setSentMessages] = useState<string[]>([]);
   return (
-    <div className="flex min-h-dvh flex-col justify-end bg-background-primary-default">
+    <div className="flex min-h-dvh flex-col justify-between bg-background-primary-default p-4">
+      <div className="mx-auto flex w-full max-w-3xl flex-col gap-2 pt-6">
+        <h2 className="text-body-bold text-text-primary">回车发送本地验证界面（无需编译桌面端）</h2>
+        <p className="text-body-small text-text-secondary">
+          在下方输入框中输入文本（支持中文拼音/英文），按 <strong>Enter</strong> 发送，<strong>Shift+Enter</strong> 换行：
+        </p>
+        <div className="flex flex-col gap-2 pt-2">
+          {sentMessages.length === 0 ? (
+            <div className="text-body-small text-text-tertiary">（暂无发送记录，请在下方输入并按回车测试）</div>
+          ) : (
+            sentMessages.map((msg, idx) => (
+              <div
+                key={idx}
+                className="rounded-xl border border-separator-border bg-background-secondary-default p-3 text-body-medium text-text-primary shadow-xs"
+              >
+                <span className="mr-2 font-mono text-xs text-text-tertiary">#{idx + 1}</span>
+                {msg}
+              </div>
+            ))
+          )}
+        </div>
+      </div>
       <ConversationFooter
         active={ACTIVE}
         workspaces={[]}
@@ -59,10 +81,10 @@ function Fixture() {
         onRemoveImage={() => {}}
         draft={draft}
         onDraftChange={setDraft}
-        onSubmit={() => {}}
-        sendShortcut="enter"
-        onStop={() => {}}
-        streaming={false}
+        onSubmit={(text) => {
+          setSentMessages((prev) => [...prev, text]);
+          setDraft("");
+        }}
         noEnabledEngines={false}
         composerInputRef={{ current: null }}
         addMenu={null}
