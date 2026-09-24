@@ -1,4 +1,5 @@
 import {
+  useEffect,
   type KeyboardEvent as ReactKeyboardEvent,
   type MutableRefObject,
   type RefObject,
@@ -85,6 +86,20 @@ export function ComposerEditable({
   const { t } = useTranslation();
   // Send gesture labels name the real modifier: ⌘ on macOS, Ctrl elsewhere.
   const isMac = navigator.platform.includes("Mac");
+
+  // Ensure composition state is accurately cleared on native compositionend,
+  // even if React's synthetic event is dropped or delayed during re-render.
+  useEffect(() => {
+    const el = editableRef.current;
+    if (!el) return;
+    const onEnd = () => {
+      isComposingRef.current = false;
+      setIsComposing(false);
+      lastCompositionEndTimeRef.current = Date.now();
+    };
+    el.addEventListener("compositionend", onEnd);
+    return () => el.removeEventListener("compositionend", onEnd);
+  }, [editableRef, isComposingRef, setIsComposing, lastCompositionEndTimeRef]);
   return (
     <div
       ref={editableRef}
@@ -113,6 +128,12 @@ export function ComposerEditable({
         emitChange();
         syncTags();
         updateTriggers();
+      }}
+      onBlur={() => {
+        if (isComposingRef.current) {
+          isComposingRef.current = false;
+          setIsComposing(false);
+        }
       }}
       onKeyDown={(event) => {
         // An open mention picker owns arrows/Enter/Tab/Escape (never
@@ -175,20 +196,35 @@ export function ComposerEditable({
         }
         // ArrowUp/ArrowDown recall submitted prompts from history.
         if (handleHistoryKeyDown(event)) return;
-        if (event.key !== "Enter" || event.nativeEvent.isComposing) return;
+        if (event.key !== "Enter") return;
         // "cmdEnter": only ⌘/Ctrl+Enter sends; bare Enter falls through to
         // the contentEditable default and inserts a newline.
         const meta = event.metaKey || event.ctrlKey;
         if (sendShortcut === "cmdEnter" ? !meta : event.shiftKey) return;
-        if (isComposingRef.current) return;
-        if (event.nativeEvent.keyCode === 229) return;
-        // Swallow the Enter that only committed the IME candidate.
-        if (Date.now() - lastCompositionEndTimeRef.current < 100) return;
+        // Never send while IME is composing candidates.
+        if (event.nativeEvent.isComposing || event.nativeEvent.keyCode === 229) return;
+        // Self-heal: if nativeEvent says not composing, clear any stuck composition flag.
+        if (isComposingRef.current) {
+          isComposingRef.current = false;
+          setIsComposing(false);
+        }
+        // WKWebView on macOS fires `compositionend` BEFORE the Enter keydown that
+        // commits the candidate. Only swallow on Mac within the recently settled window.
+        if (isMac && Date.now() - lastCompositionEndTimeRef.current < 100) return;
         event.preventDefault();
         // Fires while streaming too: the host queues the message behind the
         // active turn instead of dropping it.
         const el = editableRef.current;
-        if (!disabled && el) onSubmit?.(extractText(el));
+        if (!el) return;
+        const text = extractText(el);
+        // When the field has real text, send it immediately without waiting for
+        // React's asynchronous draft/disabled prop updates to catch up.
+        if (text.trim()) {
+          onSubmit?.(text);
+        } else if (!disabled) {
+          // Empty text with !disabled (e.g. image attachments ready to send)
+          onSubmit?.("");
+        }
       }}
       onPaste={(event) => {
         const files: File[] = [];

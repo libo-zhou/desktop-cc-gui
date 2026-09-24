@@ -182,11 +182,23 @@ export function createSessionActions(
               (s) => s.engine === t.engine && s.sessionId === t.sessionId,
             )),
       );
-      set({ openTabs: restoredTabs });
+      const initialTabs =
+        restoredTabs.length > 0
+          ? restoredTabs
+          : workspaces[0]
+            ? [
+                {
+                  engine: get().activeEngine,
+                  sessionId: null,
+                  workspacePath: workspaces[0].path,
+                },
+              ]
+            : [];
+      set({ openTabs: initialTabs });
       const persistedActive = readPersistedActive();
       const activeTab =
         persistedActive &&
-        restoredTabs.some((t) =>
+        initialTabs.some((t) =>
           sameTab(
             t,
             persistedActive.engine,
@@ -195,7 +207,7 @@ export function createSessionActions(
           ),
         )
           ? persistedActive
-          : (restoredTabs[0] ?? null);
+          : (initialTabs[0] ?? null);
       if (activeTab) activateTab(activeTab);
       ipc
         .getAppSettings()

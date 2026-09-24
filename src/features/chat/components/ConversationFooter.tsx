@@ -148,6 +148,8 @@ function FooterComposer({
   permissionMenu,
   supportsImages,
   onPasteImages,
+  hasWorkspaces,
+  fallbackWorkspacePath,
 }: {
   active: ActiveSession | null;
   draft: string;
@@ -164,6 +166,8 @@ function FooterComposer({
   permissionMenu: ReactNode;
   supportsImages: boolean;
   onPasteImages: (files: File[]) => void;
+  hasWorkspaces?: boolean;
+  fallbackWorkspacePath?: string;
 }) {
   return (
     <Composer
@@ -174,13 +178,13 @@ function FooterComposer({
       sendShortcut={sendShortcut === "cmdEnter" ? "cmdEnter" : "enter"}
       onStop={onStop}
       streaming={streaming}
-      disabled={!active || noEnabledEngines || (!draft.trim() && images.length === 0)}
+      disabled={(!active && !hasWorkspaces) || noEnabledEngines || (!draft.trim() && images.length === 0)}
       inputRef={composerInputRef}
       addMenu={<>{addMenu}<ComposerSlotExtras slot="addMenu" /></>}
       cliMenu={<>{cliMenu}<ComposerSlotExtras slot="cliMenu" /></>}
       permissionMenu={<>{permissionMenu}<ComposerSlotExtras slot="permissionMenu" /></>}
       onPasteImages={supportsImages ? onPasteImages : undefined}
-      workspacePath={active?.workspacePath}
+      workspacePath={active?.workspacePath ?? fallbackWorkspacePath}
     />
   );
 }
@@ -447,6 +451,8 @@ export function ConversationFooter({
             permissionMenu={permissionMenu}
             supportsImages={supportsImages}
             onPasteImages={onPasteImages}
+            hasWorkspaces={workspaces.length > 0}
+            fallbackWorkspacePath={workspaces[0]?.path}
           />
         )}
         <FooterStatusBar

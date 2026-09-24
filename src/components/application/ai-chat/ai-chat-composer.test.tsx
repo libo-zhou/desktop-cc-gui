@@ -1,3 +1,5 @@
+import { useState } from "react";
+import { ConversationFooter } from "@/features/chat/components/ConversationFooter";
 import { act } from "react";
 import { createRoot, type Root } from "react-dom/client";
 import { HashRouter } from "react-router-dom";
@@ -59,5 +61,198 @@ describe("Composer 草稿恢复", () => {
     const el = await render(PREFILL);
     expect(extractText(el)).toBe(PREFILL);
     expect(getCaretOffset(el)).toBe(PREFILL.length);
+  });
+
+  it("回车发送消息", async () => {
+    let submitted = "";
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer
+            value={PREFILL}
+            onValueChange={() => {}}
+            onSubmit={(val) => {
+              submitted = val;
+            }}
+            sendShortcut="enter"
+          />
+        </HashRouter>,
+      );
+    });
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    expect(submitted).toBe(PREFILL);
+  });
+  it("即使用受控 disabled=true 挂载，只要输入框有内容回车也能发送", async () => {
+    let submitted = "";
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer
+            value=""
+            disabled={true}
+            onValueChange={() => {}}
+            onSubmit={(val) => {
+              submitted = val;
+            }}
+            sendShortcut="enter"
+          />
+        </HashRouter>,
+      );
+    });
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    el.innerHTML = "即时打字";
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    expect(submitted).toBe("即时打字");
+  });
+
+  it("输入法 composition 异常残留状态在收到非组合回车时自愈并发送", async () => {
+    let submitted = "";
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer
+            value=""
+            onValueChange={() => {}}
+            onSubmit={(val) => {
+              submitted = val;
+            }}
+            sendShortcut="enter"
+          />
+        </HashRouter>,
+      );
+    });
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    // Simulate compositionstart without compositionend
+    await act(async () => {
+      el.dispatchEvent(new CompositionEvent("compositionstart", { bubbles: true }));
+    });
+    el.innerHTML = "中文输入完成";
+    // Press Enter with native isComposing=false
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    expect(submitted).toBe("中文输入完成");
+  });
+
+  it("Shift+Enter 不发送消息", async () => {
+    let submitted = "";
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer
+            value="多行文本"
+            onValueChange={() => {}}
+            onSubmit={(val) => {
+              submitted = val;
+            }}
+            sendShortcut="enter"
+          />
+        </HashRouter>,
+      );
+    });
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", shiftKey: true, bubbles: true, cancelable: true }));
+    });
+    expect(submitted).toBe("");
+  });
+
+  it("空内容回车不发送消息", async () => {
+    let submitted = "";
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Composer
+            value=""
+            disabled={true}
+            onValueChange={() => {}}
+            onSubmit={(val) => {
+              submitted = val;
+            }}
+            sendShortcut="enter"
+          />
+        </HashRouter>,
+      );
+    });
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    el.innerHTML = "   ";
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+    expect(submitted).toBe("");
+  });
+
+  it("ConversationFooter 中回车发送消息", async () => {
+    let submitted = "";
+    function Harness() {
+      const [draft, setDraft] = useState("");
+      return (
+        <ConversationFooter
+          active={{ engine: "claude", sessionId: "s-1", workspacePath: "/test-ws" }}
+          workspaces={[]}
+          queue={[]}
+          onRemoveQueued={() => {}}
+          onSendQueuedNow={() => {}}
+          imageError={null}
+          branchError={null}
+          onDismissImageError={() => {}}
+          onDismissBranchError={() => {}}
+          images={[]}
+          previews={{}}
+          onRemoveImage={() => {}}
+          draft={draft}
+          onDraftChange={setDraft}
+          onSubmit={(val) => {
+            submitted = val;
+          }}
+          sendShortcut="enter"
+          onStop={() => {}}
+          streaming={false}
+          noEnabledEngines={false}
+          composerInputRef={{ current: null }}
+          addMenu={null}
+          cliMenu={null}
+          permissionMenu={null}
+          supportsImages={false}
+          onPasteImages={() => {}}
+          sessionUsage={null}
+          contextMax={0}
+          branch={undefined}
+          branches={undefined}
+          branchRepoName={undefined}
+          onBranchSelect={() => {}}
+          startNewChat={() => {}}
+        />
+      );
+    }
+
+    await act(async () => {
+      root.render(
+        <HashRouter>
+          <Harness />
+        </HashRouter>,
+      );
+    });
+
+    const el = container.querySelector<HTMLElement>(".composer-editable")!;
+    expect(el).not.toBeNull();
+
+    // Simulate typing
+    el.innerHTML = "测试消息";
+    await act(async () => {
+      el.dispatchEvent(new Event("input", { bubbles: true }));
+    });
+
+    // Simulate pressing Enter
+    await act(async () => {
+      el.dispatchEvent(new KeyboardEvent("keydown", { key: "Enter", bubbles: true, cancelable: true }));
+    });
+
+    expect(submitted).toBe("测试消息");
   });
 });

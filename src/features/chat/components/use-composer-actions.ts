@@ -4,7 +4,7 @@ import { useShallow } from "zustand/react/shallow";
 import type { ComposerInputHandle } from "@/components/application/ai-chat/ai-chat-composer";
 import { mentionToken } from "@/components/application/ai-chat/file-tags";
 import { pickFiles } from "@/lib/platform";
-import { useChatStore, type ActiveSession } from "../store";
+import { useChatStore, sessionKey as computeSessionKey, type ActiveSession } from "../store";
 import { matchAppCommand } from "@/components/application/ai-chat/app-commands";
 import { recordPrompt } from "../prompt-history";
 import { IMAGE_EXTENSIONS } from "./use-composer-images";
@@ -54,20 +54,39 @@ export function useComposerActions({
 
   const submit = useCallback(
     (value: string) => {
-      if (!active || (!value.trim() && images.length === 0)) return;
+      let targetActive = active;
+      let targetKey = sessionKey;
+      if (!targetActive) {
+        const s = useChatStore.getState();
+        const ws =
+          s.workspaces.find((w) => !s.archivedWorkspaces?.includes(w.id)) ??
+          s.workspaces[0];
+        if (ws) {
+          startNewChat(ws.path);
+          targetActive = useChatStore.getState().active;
+          if (targetActive) {
+            targetKey = computeSessionKey(
+              targetActive.engine,
+              targetActive.sessionId,
+              targetActive.workspacePath,
+            );
+          }
+        }
+      }
+      if (!targetActive || (!value.trim() && images.length === 0)) return;
       recordPrompt(value);
-      setDraft(sessionKey, "");
+      setDraft(targetKey, "");
       clearImages();
       // App-level commands ("/new", "/compact") never reach the engine —
       // headless/protocol launches can't interpret them. A user-defined
       // catalog command of the same name takes precedence (matchAppCommand).
       if (images.length === 0) {
-        const command = matchAppCommand(value, active.workspacePath);
+        const command = matchAppCommand(value, targetActive.workspacePath);
         if (command === "new") {
-          startNewChat(active.workspacePath);
+          startNewChat(targetActive.workspacePath);
           return;
         }
-        if (command === "compact" && active.sessionId && !streaming) {
+        if (command === "compact" && targetActive.sessionId && !streaming) {
           void compactContext();
           return;
         }

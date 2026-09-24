@@ -18,7 +18,7 @@ const repoRoot = repoRootFromHere();
 const skillDir = path.join(repoRoot, CREATOR_SKILL_DIR);
 const regenerate = "运行 `pnpm plugin-skill:docs` 重新生成（SDK/扩展点/权限改了必须跑）";
 
-const skillMd = readFileSync(path.join(skillDir, "SKILL.md"), "utf8");
+const skillMd = readFileSync(path.join(skillDir, "SKILL.md"), "utf8").replace(/\r\n/g, "\n");
 
 describe("内置插件开发 skill", () => {
   it.each(buildCreatorSkillFiles(repoRoot))(
@@ -26,7 +26,7 @@ describe("内置插件开发 skill", () => {
     ({ path: rel, content }) => {
       const target = path.join(skillDir, rel);
       expect(existsSync(target), `${rel} 不存在：${regenerate}`).toBe(true);
-      expect(readFileSync(target, "utf8"), `${rel} 已过期：${regenerate}`).toBe(content);
+      expect(readFileSync(target, "utf8").replace(/\r\n/g, "\n"), `${rel} 已过期：${regenerate}`).toBe(content.replace(/\r\n/g, "\n"));
     },
   );
 
