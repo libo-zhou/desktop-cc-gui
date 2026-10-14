@@ -539,10 +539,15 @@ fn handle_item(
             }
             let cards = async_question_cards(item);
             if !cards.is_empty() {
-                let thread_id = thread_id.or(state.native_session_id.as_deref());
+                let thread_id = thread_id
+                    .map(str::to_string)
+                    .or_else(|| state.native_session_id.clone());
                 if let (Some(request_id), Some(thread_id), Some(turn_id)) = (
                     item_id.map(str::trim).filter(|id| !id.is_empty()),
-                    thread_id.map(str::trim).filter(|id| !id.is_empty()),
+                    thread_id
+                        .as_deref()
+                        .map(str::trim)
+                        .filter(|id| !id.is_empty()),
                     view.turn_id.as_deref().map(str::trim).filter(|id| !id.is_empty()),
                 ) {
                     park_async_question(
