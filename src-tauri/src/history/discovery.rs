@@ -101,7 +101,7 @@ pub(super) fn discover_claude(workspace: &Path) -> Vec<SessionFile> {
 }
 
 pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
-    let base = crate::engine::engine_home(Some("CODEBUDDY_DATA_DIR"), ".codebuddy").join("projects");
+    let base = crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("projects");
     let mut out = Vec::new();
     let mut seen_sessions = std::collections::HashSet::new();
     for dir in claude_project_dirs(&base, workspace) {

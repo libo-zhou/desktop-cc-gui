@@ -3,7 +3,6 @@ use super::{
     SendRequest,
 };
 use serde::Serialize;
-use std::path::PathBuf;
 
 #[derive(Debug, Clone, Serialize, Default)]
 #[serde(rename_all = "camelCase")]
@@ -40,7 +39,7 @@ pub fn check_codebuddy_account_status() -> CodeBuddyAccountStatus {
     #[cfg(windows)]
     if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
         candidates.push(
-            PathBuf::from(appdata)
+            std::path::PathBuf::from(appdata)
                 .join("CodeBuddyExtension")
                 .join("Data")
                 .join("Public")
@@ -294,13 +293,16 @@ mod tests {
 
     fn sample_req() -> SendRequest {
         SendRequest {
-            prompt: "say hello".to_string(),
-            images: Vec::new(),
             session_id: None,
-            model: Some("hy4-preview".to_string()),
-            permission: Some("auto".to_string()),
             workspace: PathBuf::from("D:\\ws"),
+            prompt: "say hello".to_string(),
+            prompt_contributions: Vec::new(),
+            native_compact: false,
+            images: Vec::new(),
+            model: Some("hy4-preview".to_string()),
             effort: Some("high".to_string()),
+            service_tier: None,
+            permission: Some("auto".to_string()),
             additional_dirs: Vec::new(),
             provider_id: None,
             computer_use: None,
@@ -374,10 +376,11 @@ mod tests {
         engine.parse_line(sample, &mut out);
         assert_eq!(out.len(), 1);
         match &out[0] {
-            EngineEvent::AssistantMessage(msg) => {
-                assert_eq!(msg, "hello world");
+            EngineEvent::Message { role, text, .. } => {
+                assert_eq!(role, "assistant");
+                assert_eq!(text, "hello world");
             }
-            other => panic!("expected AssistantMessage, got {other:?}"),
+            other => panic!("expected EngineEvent::Message, got {other:?}"),
         }
     }
 }
