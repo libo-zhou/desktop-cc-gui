@@ -18,7 +18,9 @@ import { PiFamilyAuthSection } from "./PiFamilyAuthSection";
 import { CodeBuddyAuthSection } from "./CodeBuddyAuthSection";
 import type { CliConfigState } from "./useCliConfig";
 
+/** Engines cc-switch manages — the import dropdown only shows on these tabs. */
 const CCS_IMPORT_ENGINES: readonly EngineId[] = ["claude", "codex", "grok"];
+
 /**
  * The loaded CLI config UI:
  *   cc-switch sync banner (when the store changed)

@@ -5,86 +5,60 @@
  */
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/features/chat/store";
-import { hasTerminalSession, terminalBacklog, ensureTerminalOutputListener } from "@/features/terminal/sessions";
+import { ensureTerminalOutputListener } from "@/features/terminal/sessions";
 import { useTerminalStore } from "@/features/terminal/store";
+import {
+  ENTER,
+  settleTerminalBacklog,
+  shellQuote,
+  waitForCliReady,
+  waitForSession,
+} from "./terminalLogin";
 
-const ENTER = "\r";
-
-function shellQuote(bin: string): string {
-  return bin.includes(" ") ? `"${bin}"` : bin;
-}
-
-function delay(ms: number): Promise<void> {
-  const { promise, resolve } = Promise.withResolvers<void>();
-  setTimeout(resolve, ms);
-  return promise;
-}
-
-/** Poll until TerminalView has spawned the backend PTY for `id`. */
-async function waitForSession(id: string, timeoutMs = 5000): Promise<boolean> {
-  const deadline = Date.now() + timeoutMs;
-  while (Date.now() < deadline) {
-    if (hasTerminalSession(id)) return true;
-    await delay(100);
-  }
-  return false;
-}
-
-/**
- * Wait until the CLI has actually started before typing `/login` into it.
- * The previous fixed 1.5s delay raced with slow cold starts: the text then
- * landed at the shell prompt and ran as a shell command. We poll the
- * terminal backlog until output grows well past the echoed launch command
- * (the CLI clears the screen and draws its TUI). On timeout we send anyway
- * — that is no worse than the old fixed delay.
- */
-async function waitForCliReady(
-  id: string,
-  baseline: number,
-  echoLength: number,
-  timeoutMs = 15_000,
-): Promise<void> {
-  const deadline = Date.now() + timeoutMs;
-  // Echo of the launch line plus shell control bytes; real CLI output (TUI
-  // redraw) is far larger than this slack.
-  const threshold = baseline + echoLength + 80;
-  while (Date.now() < deadline) {
-    if (terminalBacklog(id).length > threshold) return;
-    await delay(200);
-  }
-}
+export type CodeBuddyLoginResult =
+  | { ok: true }
+  /** No chat tab and no known workspace to host the terminal. */
+  | { ok: false; reason: "no-workspace" }
+  /** The terminal tab opened but its PTY never became usable. */
+  | { ok: false; reason: "terminal-unavailable" };
 
 /**
  * Open the terminal dock on a fresh tab and start CodeBuddy login flow.
  * Falls back to the first known workspace when no chat tab is active (fresh
- * app launch). Returns false when there is no workspace to host the terminal.
+ * app launch). A failed spawn closes the tab it created so no orphan is left.
  */
-export async function launchCodeBuddyLogin(): Promise<boolean> {
+export async function launchCodeBuddyLogin(): Promise<CodeBuddyLoginResult> {
   const state = useChatStore.getState();
-  const workspacePath =
-    state.active?.workspacePath ?? state.workspaces[0]?.path;
-  if (!workspacePath) return false;
+  const workspacePath = state.active?.workspacePath ?? state.workspaces[0]?.path;
+  if (!workspacePath) return { ok: false, reason: "no-workspace" };
 
   const term = useTerminalStore.getState();
   if (!term.open) term.toggle(workspacePath);
   useTerminalStore.getState().newTab(workspacePath);
   const id = useTerminalStore.getState().activeByWorkspace[workspacePath];
-  if (!id) return false;
+  if (!id) return { ok: false, reason: "terminal-unavailable" };
 
   const settings = await ipc.getAppSettings().catch(() => null);
   const customBin = settings?.codebuddyBin?.trim();
   const bin = shellQuote(customBin || "codebuddy");
 
-  if (!(await waitForSession(id))) return false;
+  if (!(await waitForSession(id))) {
+    // The dock is open on a tab whose PTY never came up; close it instead of
+    // leaving an orphan behind a "no workspace" message.
+    useTerminalStore.getState().closeTab(workspacePath, id);
+    return { ok: false, reason: "terminal-unavailable" };
+  }
 
   ensureTerminalOutputListener(); // idempotent; terminalBacklog depends on it
-  const baseline = terminalBacklog(id).length;
+  // Baseline after the prompt settles: the CLI's TUI must produce output past
+  // this point, otherwise /login lands while the shell still owns the line.
+  const baseline = await settleTerminalBacklog(id);
   void ipc.terminalWrite(id, `${bin}${ENTER}`).catch(() => {});
-  // Fire-and-forget: resolve /login delivery in the background so the
-  // caller can navigate away immediately.
+  // Fire-and-forget: resolve /login delivery in the background so the caller
+  // can navigate away immediately.
   void (async () => {
     await waitForCliReady(id, baseline, bin.length + ENTER.length);
     void ipc.terminalWrite(id, `/login${ENTER}`).catch(() => {});
   })();
-  return true;
+  return { ok: true };
 }

@@ -100,18 +100,56 @@ pub(super) fn discover_claude(workspace: &Path) -> Vec<SessionFile> {
     out
 }
 
-pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
-    // The CLI names project dirs with its own encoding (drops the leading
-    // separator, keeps spaces/underscores/case: /Users/a/CCGUI 项目/b →
-    // Users-a-CCGUI 项目-b), which differs from claude_encode_project_path
-    // and is not publicly specified. Scan every projects/* dir and attribute
-    // each transcript by the cwd/sessionId recorded on its lines instead of
-    // reverse-engineering the directory name.
-    let base = crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("projects");
-    let mut out = Vec::new();
-    let mut seen_sessions = std::collections::HashSet::new();
+/// One CodeBuddy transcript found on disk. `session_id`/`cwd` come from its
+/// head lines; the project directory name is CLI-private.
+pub(super) struct CodebuddyTranscript {
+    pub session_id: String,
+    pub cwd: String,
+    pub path: PathBuf,
+    modified: std::time::SystemTime,
+}
+
+/// Enumerate every CodeBuddy transcript once per scan.
+///
+/// The CLI names project dirs with its own encoding (drops the leading
+/// separator, keeps spaces/underscores/case: /Users/a/CCGUI 项目/b →
+/// Users-a-CCGUI 项目-b), which differs from claude_encode_project_path and is
+/// not publicly specified. Attribution therefore uses the cwd recorded on each
+/// transcript, which requires reading its head — do that once per scan rather
+/// than once per workspace (the scan used to pay O(workspaces × transcripts)
+/// head reads). Deduping by session id here, newest transcript wins, makes the
+/// retained file deterministic: read_dir order is unspecified, and a session
+/// can appear under several project dirs after a resume or workspace move.
+pub(super) fn codebuddy_transcripts() -> Vec<CodebuddyTranscript> {
+    let mut by_session: std::collections::HashMap<String, CodebuddyTranscript> =
+        std::collections::HashMap::new();
+    for transcript in codebuddy_raw_transcripts() {
+        let session_id = transcript.session_id.clone();
+        match by_session.entry(session_id) {
+            std::collections::hash_map::Entry::Occupied(mut current) => {
+                let kept = current.get();
+                if (transcript.modified, &transcript.path) > (kept.modified, &kept.path) {
+                    current.insert(transcript);
+                }
+            }
+            std::collections::hash_map::Entry::Vacant(slot) => {
+                slot.insert(transcript);
+            }
+        }
+    }
+    let mut found: Vec<CodebuddyTranscript> = by_session.into_values().collect();
+    // Stable candidate order regardless of hash iteration order.
+    found.sort_by(|a, b| a.path.cmp(&b.path));
+    found
+}
+
+/// Every transcript on disk (no dedupe). Deletion needs the duplicates too.
+fn codebuddy_raw_transcripts() -> Vec<CodebuddyTranscript> {
+    let base =
+        crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("projects");
+    let mut found = Vec::new();
     let Ok(projects) = std::fs::read_dir(&base) else {
-        return out;
+        return found;
     };
     for project in projects.flatten() {
         let dir = project.path();
@@ -129,20 +167,56 @@ pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
             let Some((session_id, cwd)) = codebuddy_head(&path) else {
                 continue;
             };
-            if !same_or_child(Path::new(&cwd), workspace)
-                || !seen_sessions.insert(session_id.clone())
-            {
-                continue;
-            }
-            out.push(SessionFile {
-                engine: "codebuddy",
+            let modified = entry
+                .metadata()
+                .and_then(|metadata| metadata.modified())
+                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+            found.push(CodebuddyTranscript {
                 session_id,
-                workspace_path: workspace.to_string_lossy().to_string(),
-                file_path: path,
+                cwd,
+                path,
+                modified,
             });
         }
     }
-    out
+    found
+}
+
+pub(super) fn discover_codebuddy_in(
+    transcripts: &[CodebuddyTranscript],
+    workspace: &Path,
+) -> Vec<SessionFile> {
+    transcripts
+        .iter()
+        .filter(|transcript| same_or_child(Path::new(&transcript.cwd), workspace))
+        .map(|transcript| SessionFile {
+            engine: "codebuddy",
+            session_id: transcript.session_id.clone(),
+            workspace_path: workspace.to_string_lossy().to_string(),
+            file_path: transcript.path.clone(),
+        })
+        .collect()
+}
+
+pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
+    discover_codebuddy_in(&codebuddy_transcripts(), workspace)
+}
+
+/// Session id recorded in a transcript's head; `None` when the file carries
+/// no cwd/sessionId at all.
+pub(super) fn codebuddy_session_id(path: &Path) -> Option<String> {
+    codebuddy_head(path).map(|(session_id, _)| session_id)
+}
+
+/// Every on-disk transcript carrying `session_id`. Deleting a session must
+/// clear all copies: the scan keeps the newest one, so a sibling left behind
+/// would resurrect the session on the next scan.
+pub(super) fn codebuddy_session_paths(session_id: &str) -> Vec<PathBuf> {
+    codebuddy_raw_transcripts()
+        .into_iter()
+        .filter(|transcript| transcript.session_id == session_id)
+        .map(|transcript| transcript.path)
+        .collect()
 }
 
 /// Session identity from a CodeBuddy transcript's head lines: every
@@ -150,9 +224,12 @@ pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
 /// `{"type":"message","role":"user",...,"sessionId":...,"cwd":...}`).
 /// Non-conversation head lines (file-history-snapshot, ai-title) are skipped
 /// while scanning. Falls back to the file stem when the line carries cwd
-/// but no sessionId.
+/// but no sessionId. Bookkeeping lines consume the same budget as
+/// conversation lines, and `peek_head_json_lines` already caps total bytes,
+/// so a generous line budget costs nothing and avoids dropping sessions whose
+/// head carries many snapshots.
 fn codebuddy_head(path: &Path) -> Option<(String, String)> {
-    for head in peek_head_json_lines(path, false, 8) {
+    for head in peek_head_json_lines(path, false, 64) {
         let Some(cwd) = head
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -1366,6 +1443,51 @@ mod tests {
         let found = discover_codebuddy(&workspace);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "stem-id");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn codebuddy_transcripts_pick_newest_duplicate_deterministically() {
+        let home = scratch_dir("discover-codebuddy-dupe");
+        let config_dir = home.join("codebuddy-config");
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let cwd = workspace.to_string_lossy().replace('\\', "\\\\");
+        let mut paths = Vec::new();
+        for dir in ["a", "b"] {
+            let project = config_dir.join("projects").join(dir);
+            std::fs::create_dir_all(&project).unwrap();
+            let path = project.join("same.jsonl");
+            std::fs::write(
+                &path,
+                format!(
+                    "{{\"type\":\"message\",\"role\":\"user\",\"content\":[],\"sessionId\":\"dup\",\"cwd\":\"{cwd}\"}}\n"
+                ),
+            )
+            .unwrap();
+            paths.push(path);
+        }
+        // Make the second copy strictly newer: read_dir order is unspecified,
+        // so selection must come from mtime, not enumeration order.
+        let newer = std::time::SystemTime::now() + std::time::Duration::from_secs(60);
+        std::fs::File::options()
+            .write(true)
+            .open(&paths[1])
+            .unwrap()
+            .set_modified(newer)
+            .unwrap();
+
+        let _guard = CodebuddyConfigDirGuard::set(&config_dir);
+        let transcripts = codebuddy_transcripts();
+        assert_eq!(transcripts.len(), 1);
+        assert_eq!(transcripts[0].path, paths[1]);
+        let found = discover_codebuddy(&workspace);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].file_path, paths[1]);
+        // Deletion must see every copy, not only the retained one.
+        let copies = codebuddy_session_paths("dup");
+        assert_eq!(copies.len(), 2);
 
         std::fs::remove_dir_all(&home).ok();
     }

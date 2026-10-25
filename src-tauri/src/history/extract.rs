@@ -1424,9 +1424,24 @@ fn codebuddy_message_rows(value: &Value, images: ImageMode, ts: Option<String>) 
             }]
         };
     };
-    let mut out = Vec::new();
+    let mut out: LineRows = Vec::new();
     let mut text = String::new();
     let mut collected: Vec<String> = Vec::new();
+    // Flush buffered text/images before every tool row so the transcript keeps
+    // its content order (the history view renders rows in emission order).
+    let flush_text = |out: &mut LineRows, text: &mut String, collected: &mut Vec<String>| {
+        if !text.trim().is_empty() {
+            out.push(LineRow {
+                images: std::mem::take(collected),
+                ..LineRow::new(role, std::mem::take(text), ts.clone())
+            });
+        } else if !collected.is_empty() {
+            out.push(LineRow {
+                images: std::mem::take(collected),
+                ..LineRow::new(role, String::new(), ts.clone())
+            });
+        }
+    };
     for block in blocks {
         match block.get("type").and_then(Value::as_str) {
             Some("input_text") | Some("output_text") | Some("text") => {
@@ -1441,25 +1456,29 @@ fn codebuddy_message_rows(value: &Value, images: ImageMode, ts: Option<String>) 
                     }
                 }
             }
-            Some("function_call") => out.push(codebuddy_tool_row(block, ts.clone())),
+            Some("function_call") => {
+                flush_text(&mut out, &mut text, &mut collected);
+                out.push(codebuddy_tool_row(block, ts.clone()));
+            }
             Some("function_call_output") => {
-                out.extend(codebuddy_tool_result_row(block, ts.clone()))
+                flush_text(&mut out, &mut text, &mut collected);
+                out.extend(codebuddy_tool_result_row(block, ts.clone()));
             }
             _ => {}
         }
     }
-    if !text.trim().is_empty() {
-        out.push(LineRow {
-            usage,
-            model,
-            images: collected,
-            ..LineRow::new(role, text, ts)
-        });
-    } else if !collected.is_empty() {
-        out.push(LineRow {
-            images: collected,
-            ..LineRow::new(role, String::new(), ts)
-        });
+    flush_text(&mut out, &mut text, &mut collected);
+    // usage/model belong to the turn, not to one block: attach them to the
+    // message's last content row, or to its last row when the content holds
+    // only tool blocks (otherwise a tool-only turn loses its usage entirely).
+    let target = out
+        .iter()
+        .rposition(|row| row.role == role)
+        .or_else(|| (!out.is_empty()).then(|| out.len() - 1));
+    if let Some(index) = target {
+        let row = &mut out[index];
+        row.usage = usage;
+        row.model = model;
     }
     out
 }
@@ -2834,6 +2853,49 @@ mod tests {
         assert_eq!(summary.first_ts, Some(1761200000000));
         assert_eq!(summary.last_ts, Some(1761200003000));
         std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn codebuddy_message_keeps_text_tool_order_and_usage() {
+        let line = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "output_text", "text": "先读文件"},
+                {"type": "function_call", "name": "Read", "arguments": "{\"path\":\"/a\"}", "call_id": "c1"},
+                {"type": "output_text", "text": "读完了"}
+            ],
+            "usage": {"input_tokens": 5, "output_tokens": 2},
+            "model": "hy4-preview",
+            "timestamp": 1761200000000_i64
+        });
+        let rows = extract_codebuddy_line(&line, ImageMode::Collect);
+        let kinds: Vec<&str> = rows.iter().map(|row| row.role.as_str()).collect();
+        assert_eq!(kinds, ["assistant", "tool", "assistant"]);
+        assert_eq!(rows[0].text, "先读文件");
+        assert_eq!(rows[2].text, "读完了");
+        // usage/model ride the message's last content row, not the tool row.
+        assert!(rows[0].usage.is_none());
+        assert_eq!(
+            rows[2].usage.as_ref().unwrap()["input_tokens"],
+            serde_json::json!(5)
+        );
+        assert_eq!(rows[2].model.as_deref(), Some("hy4-preview"));
+
+        // Tool-only content must not lose the turn's usage/model.
+        let tool_only = serde_json::json!({
+            "type": "message",
+            "role": "assistant",
+            "content": [
+                {"type": "function_call", "name": "Read", "arguments": "{}", "call_id": "c2"}
+            ],
+            "usage": {"input_tokens": 1, "output_tokens": 1},
+            "model": "glm-5.3"
+        });
+        let rows = extract_codebuddy_line(&tool_only, ImageMode::Collect);
+        assert_eq!(rows.len(), 1);
+        assert!(rows[0].usage.is_some());
+        assert_eq!(rows[0].model.as_deref(), Some("glm-5.3"));
     }
 
     #[test]

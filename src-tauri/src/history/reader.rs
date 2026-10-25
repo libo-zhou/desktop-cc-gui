@@ -732,13 +732,17 @@ pub async fn load_remote_session_page(
 /// so a session cannot "delete then resurrect" on the next scan.
 fn delete_session_disk(engine: &str, path: &Path) -> Result<(), String> {
     match engine {
-        "claude" | "codex" | "pi" | "omp" | "agy" | "qoder" | "qoder-cn" | "codebuddy" => {
+        "claude" | "codex" | "pi" | "omp" | "agy" | "qoder" | "qoder-cn" => {
             match std::fs::remove_file(path) {
                 Ok(()) => Ok(()),
                 Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(()),
                 Err(e) => Err(format!("remove {}: {e}", path.display())),
             }
         }
+        // codebuddy: a session id can exist under more than one project dir
+        // (resume/move). The scan keeps the newest copy, so removing only the
+        // recorded path would let a sibling resurrect the session.
+        "codebuddy" => delete_codebuddy_session_disk(path),
         // opencode: the db row points at `storage/session/<project>/<id>.json`;
         // the transcript also lives in `storage/message/<id>/` and one
         // `storage/part/<msg>/` dir per message — all under the same storage root.
@@ -748,6 +752,28 @@ fn delete_session_disk(engine: &str, path: &Path) -> Result<(), String> {
         // 扫描"复活"(dsh 曾落进 kimi/grok 兜底 arm,锚定校验必失败而删不掉)。
         _ => Err(format!("delete_session: unknown engine {engine}")),
     }
+}
+
+/// codebuddy: single-file transcripts under CLI-private project dirs. Resolve
+/// the session id from the recorded file, then remove every copy before
+/// reporting success.
+fn delete_codebuddy_session_disk(path: &Path) -> Result<(), String> {
+    let mut paths = vec![path.to_path_buf()];
+    if let Some(session_id) = super::discovery::codebuddy_session_id(path) {
+        for sibling in super::discovery::codebuddy_session_paths(&session_id) {
+            if !paths.contains(&sibling) {
+                paths.push(sibling);
+            }
+        }
+    }
+    for candidate in paths {
+        match std::fs::remove_file(&candidate) {
+            Ok(()) => {}
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {}
+            Err(e) => return Err(format!("remove {}: {e}", candidate.display())),
+        }
+    }
+    Ok(())
 }
 
 /// kimi/grok/dsh:db 行指向会话目录内的主转录本,删除整个会话目录

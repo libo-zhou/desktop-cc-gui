@@ -13,9 +13,6 @@ pub struct CodeBuddyAccountStatus {
     /// documented), so a negative probe is "unknown", not "logged out".
     /// Only a positive probe is conclusive.
     pub detection: &'static str,
-    pub uid: Option<String>,
-    pub display_name: Option<String>,
-    pub enterprise_name: Option<String>,
 }
 
 /// CodeBuddy stores CLI credentials in the OS credential manager per its
@@ -34,12 +31,10 @@ fn cli_credentials_present() -> bool {
         ["codebuddy", "CodeBuddy", "com.tencent.codebuddy"]
             .iter()
             .any(|service| {
-                std::process::Command::new("security")
-                    .args(["find-generic-password", "-s", service])
-                    .stdout(std::process::Stdio::null())
-                    .stderr(std::process::Stdio::null())
-                    .status()
-                    .map(|status| status.success())
+                let mut cmd = std::process::Command::new("security");
+                cmd.args(["find-generic-password", "-s", service]);
+                run_probe_command(cmd)
+                    .map(|out| out.status.success())
                     .unwrap_or(false)
             })
     }
@@ -47,9 +42,9 @@ fn cli_credentials_present() -> bool {
     {
         // `cmdkey /list` prints target names of stored credentials, never
         // secrets.
-        std::process::Command::new("cmdkey")
-            .arg("/list")
-            .output()
+        let mut cmd = std::process::Command::new("cmdkey");
+        cmd.arg("/list");
+        run_probe_command(cmd)
             .map(|out| {
                 String::from_utf8_lossy(&out.stdout)
                     .to_lowercase()
@@ -61,13 +56,47 @@ fn cli_credentials_present() -> bool {
     {
         // `secret-tool search` exits non-zero when nothing matches; without
         // `--unlock` it prints item attributes only, never the secret.
-        std::process::Command::new("secret-tool")
-            .args(["search", "service", "codebuddy"])
-            .stdout(std::process::Stdio::null())
-            .stderr(std::process::Stdio::null())
-            .status()
-            .map(|status| status.success())
+        let mut cmd = std::process::Command::new("secret-tool");
+        cmd.args(["search", "service", "codebuddy"]);
+        run_probe_command(cmd)
+            .map(|out| out.status.success())
             .unwrap_or(false)
+    }
+}
+
+/// Credential-store tools can block indefinitely (locked keyring, missing
+/// session D-Bus, unlock prompt), and the settings page re-probes on every
+/// window focus. Every probe therefore runs under a hard deadline: poll the
+/// child and kill it once the budget is spent, so the IPC call always settles
+/// and blocked probes cannot pile up.
+const ACCOUNT_PROBE_TIMEOUT: std::time::Duration = std::time::Duration::from_millis(1500);
+
+fn run_probe_command(mut cmd: std::process::Command) -> Option<std::process::Output> {
+    #[cfg(windows)]
+    {
+        use std::os::windows::process::CommandExt;
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // cmdkey is console-subsystem: without this flag every focus-triggered
+        // probe flashes a console window (same fix as engine::hide_console).
+        cmd.creation_flags(CREATE_NO_WINDOW);
+    }
+    cmd.stdin(std::process::Stdio::null())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null());
+    let mut child = cmd.spawn().ok()?;
+    let deadline = std::time::Instant::now() + ACCOUNT_PROBE_TIMEOUT;
+    loop {
+        match child.try_wait() {
+            Ok(Some(_)) => return child.wait_with_output().ok(),
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(25));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return None;
+            }
+        }
     }
 }
 
@@ -84,16 +113,21 @@ pub fn check_codebuddy_account_status() -> CodeBuddyAccountStatus {
 
 /// The settings page re-probes on every window focus, and each probe spawns
 /// up to three credential-store processes. Cache the result briefly: login
-/// state changes on a minutes scale, not a focus-Event scale.
+/// state changes on a minutes scale, not a focus-Event scale. An explicit
+/// refresh passes `force`, because the one action that must re-probe (right
+/// after `/login`) would otherwise receive the pre-login cached answer.
 const ACCOUNT_STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
 
 #[tauri::command]
-pub async fn codebuddy_account_status() -> Result<CodeBuddyAccountStatus, String> {
-    static CACHE: std::sync::Mutex<
-        Option<(std::time::Instant, CodeBuddyAccountStatus)>,
-    > = std::sync::Mutex::new(None);
-    {
-        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+pub async fn codebuddy_account_status(
+    force: Option<bool>,
+) -> Result<CodeBuddyAccountStatus, String> {
+    static CACHE: tokio::sync::Mutex<Option<(std::time::Instant, CodeBuddyAccountStatus)>> =
+        tokio::sync::Mutex::const_new(None);
+    // Held across the probe so concurrent focus events share one probe set
+    // (single flight) instead of each spawning the full set after a miss.
+    let mut cache = CACHE.lock().await;
+    if !force.unwrap_or(false) {
         if let Some((at, status)) = cache.as_ref() {
             if at.elapsed() < ACCOUNT_STATUS_CACHE_TTL {
                 return Ok(status.clone());
@@ -104,7 +138,6 @@ pub async fn codebuddy_account_status() -> Result<CodeBuddyAccountStatus, String
     let status = tokio::task::spawn_blocking(check_codebuddy_account_status)
         .await
         .map_err(|e| format!("codebuddy account probe: {e}"))?;
-    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
     *cache = Some((std::time::Instant::now(), status.clone()));
     Ok(status)
 }
@@ -134,6 +167,7 @@ const CHANNEL_SETTINGS_ENV_KEYS: &[&str] = &[
 pub(super) fn apply_channel(
     built: &mut BuiltCommand,
     env: &std::collections::HashMap<String, String>,
+    model: Option<&str>,
     directory: &std::path::Path,
 ) -> Result<(), String> {
     let mut overlay = serde_json::Map::new();
@@ -143,7 +177,15 @@ pub(super) fn apply_channel(
     for (key, value) in env {
         overlay.insert(key.clone(), serde_json::Value::String(value.clone()));
     }
-    let settings = serde_json::json!({ "env": overlay });
+    let mut settings = serde_json::json!({ "env": overlay });
+    // A stale top-level `model` in the user's native settings.json survives a
+    // `--settings` merge (that is exactly how models/codebuddy.rs reads the
+    // configured default). Mirror the selected model into the overlay so a
+    // channel send cannot silently run the native account's model when the
+    // caller supplied one.
+    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+        settings["model"] = serde_json::Value::String(model.to_string());
+    }
     stage_overlay(built, &settings, directory)
 }
 
@@ -152,11 +194,25 @@ fn stage_overlay(
     settings: &serde_json::Value,
     directory: &std::path::Path,
 ) -> Result<(), String> {
-    let content = serde_json::to_vec(settings)
-        .map_err(|_| "Cannot serialize CodeBuddy channel settings".to_string())?;
+    let path = stage_private_json(directory, "channel", settings)?;
+    built.cleanup_files.push(path.clone());
+    built.command.arg("--settings").arg(path);
+    Ok(())
+}
+
+/// Stage a JSON document in a private 0600 file for argv flags that would
+/// otherwise expose credentials (`--settings`, `--mcp-config`) to `ps` /
+/// `/proc/<pid>/cmdline for the child's whole lifetime.
+fn stage_private_json(
+    directory: &std::path::Path,
+    prefix: &str,
+    value: &serde_json::Value,
+) -> Result<std::path::PathBuf, String> {
+    let content = serde_json::to_vec(value)
+        .map_err(|_| format!("Cannot serialize CodeBuddy {prefix} settings"))?;
     std::fs::create_dir_all(directory)
         .map_err(|e| format!("create CodeBuddy staging directory: {e}"))?;
-    let path = directory.join(format!("channel-{}.json", uuid::Uuid::new_v4()));
+    let path = directory.join(format!("{prefix}-{}.json", uuid::Uuid::new_v4()));
     let mut options = std::fs::OpenOptions::new();
     options.write(true).create_new(true);
     #[cfg(unix)]
@@ -167,12 +223,10 @@ fn stage_overlay(
     let mut file = options
         .open(&path)
         .map_err(|e| format!("create private CodeBuddy settings: {e}"))?;
-    built.cleanup_files.push(path.clone());
     use std::io::Write;
     file.write_all(&content)
         .map_err(|e| format!("write private CodeBuddy settings: {e}"))?;
-    built.command.arg("--settings").arg(path);
-    Ok(())
+    Ok(path)
 }
 pub struct CodeBuddyEngine {
     inner: ClaudeEngine,
@@ -199,6 +253,14 @@ impl Engine for CodeBuddyEngine {
         true
     }
 
+    fn supports_computer_use(&self) -> bool {
+        true
+    }
+
+    fn supports_memory(&self) -> bool {
+        true
+    }
+
     fn supported_permissions(&self) -> &'static [&'static str] {
         // No "manual": CodeBuddy headless does not support
         // --permission-prompt-tool, so a mode that promises "ask every time"
@@ -222,6 +284,9 @@ impl Engine for CodeBuddyEngine {
         cmd.arg("--include-partial-messages");
 
         let mut preapproved: Vec<&str> = Vec::new();
+        // Files staged for this child (private settings / MCP config); removed
+        // once the child exits, and swept at startup if the app dies mid-run.
+        let mut cleanup_files: Vec<std::path::PathBuf> = Vec::new();
 
         // MCP servers first: their pre-approved tool names must land in the
         // SAME --allowedTools emission as everything else — if the CLI treats
@@ -240,11 +305,30 @@ impl Engine for CodeBuddyEngine {
         }
         if !mcp_servers.is_empty() {
             let config = serde_json::json!({ "mcpServers": mcp_servers });
-            cmd.arg("--mcp-config");
-            cmd.arg(config.to_string());
+            // The overlay control token (CCGUI_CU_TOKEN) rides the server's
+            // `env`; inline JSON would expose it on argv for the child's whole
+            // lifetime, so stage it in a private file like the channel overlay.
+            let path = stage_private_json(
+                &crate::paths::app_home().join("codebuddy-staging"),
+                "mcp",
+                &config,
+            )?;
+            cleanup_files.push(path.clone());
+            cmd.arg("--mcp-config").arg(path);
         }
 
-        if let Some(tools) = req.allowed_tools.as_deref() {
+        let allowed: Vec<&str> = req
+            .allowed_tools
+            .as_deref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if !allowed.is_empty() {
             cmd.arg("--permission-mode");
             cmd.arg("plan");
             // --allowedTools only pre-approves without prompting; it is not a
@@ -253,16 +337,16 @@ impl Engine for CodeBuddyEngine {
             // model, including tools a future CLI version adds.
             cmd.arg("--tools");
             cmd.arg(
-                tools
+                allowed
                     .iter()
-                    .map(|t| t.as_str())
+                    .copied()
                     .chain(preapproved.iter().copied())
                     .collect::<Vec<_>>()
                     .join(","),
             );
             cmd.arg("--allowedTools");
-            for tool in tools {
-                cmd.arg(tool);
+            for tool in &allowed {
+                cmd.arg(*tool);
             }
             for tool in &preapproved {
                 cmd.arg(*tool);
@@ -270,12 +354,12 @@ impl Engine for CodeBuddyEngine {
             // Defense in depth on top of --tools: deny the known write/exec/
             // sub-agent tools explicitly so a read-only whitelist stays
             // read-only even if the whitelist flag is ignored.
-            cmd.arg("--disallowedTools");
+            //
             // CodeBuddy names differ from Claude's: PowerShell is the shell
             // tool on Windows and Agent/Workflow/TeamCreate spawn sub-agents.
             // Deny both families so a read-only whitelist stays read-only
             // even when the user's settings.json permissions.allow lists them.
-            for tool in [
+            let denied: Vec<&str> = [
                 "Bash",
                 "PowerShell",
                 "Edit",
@@ -285,8 +369,15 @@ impl Engine for CodeBuddyEngine {
                 "Agent",
                 "Workflow",
                 "TeamCreate",
-            ] {
-                if !tools.iter().any(|allowed| allowed == tool) {
+            ]
+            .into_iter()
+            .filter(|tool| !allowed.contains(tool))
+            .collect();
+            // Never emit a flag with zero values: the next flag would be
+            // consumed as its argument.
+            if !denied.is_empty() {
+                cmd.arg("--disallowedTools");
+                for tool in denied {
                     cmd.arg(tool);
                 }
             }
@@ -365,7 +456,7 @@ impl Engine for CodeBuddyEngine {
             command: cmd,
             stdin_payload: Some(stdin_payload),
             keep_stdin_open: true,
-            cleanup_files: Vec::new(),
+            cleanup_files,
             mcp_restore: None,
             preassigned_session_id: None,
         })
@@ -407,6 +498,8 @@ mod tests {
         assert_eq!(engine.id(), "codebuddy");
         assert!(engine.supports_images());
         assert!(engine.supports_effort());
+        assert!(engine.supports_computer_use());
+        assert!(engine.supports_memory());
         assert!(engine.supports_tool_constraints());
         assert_eq!(
             engine.supported_permissions(),
@@ -551,7 +644,7 @@ mod tests {
             "ccgui-codebuddy-stage-{}",
             uuid::Uuid::new_v4()
         ));
-        apply_channel(&mut built, &env, &dir).unwrap();
+        apply_channel(&mut built, &env, None, &dir).unwrap();
         let args: Vec<_> = built
             .command
             .as_std()
@@ -593,6 +686,102 @@ mod tests {
         super::super::cleanup_staged_files(&built.cleanup_files);
         assert!(!staged_path.exists());
         std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn channel_overlay_mirrors_selected_model() {
+        let mut built = BuiltCommand {
+            command: tokio::process::Command::new("codebuddy"),
+            stdin_payload: None,
+            keep_stdin_open: false,
+            cleanup_files: Vec::new(),
+            mcp_restore: None,
+            preassigned_session_id: None,
+        };
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-codebuddy-model-{}",
+            uuid::Uuid::new_v4()
+        ));
+        apply_channel(
+            &mut built,
+            &std::collections::HashMap::new(),
+            Some(" glm-5.3 "),
+            &dir,
+        )
+        .unwrap();
+        let staged_path = built.cleanup_files[0].clone();
+        let staged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(&staged_path).unwrap()).unwrap();
+        // A selected model must outrank a stale native settings.json `model`.
+        assert_eq!(staged["model"], "glm-5.3");
+        super::super::cleanup_staged_files(&built.cleanup_files);
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn tool_flags_never_dangle_when_every_deniable_tool_is_allowed() {
+        let engine = CodeBuddyEngine::new();
+        let mut req = sample_req();
+        req.allowed_tools = Some(
+            [
+                "Bash",
+                "PowerShell",
+                "Edit",
+                "Write",
+                "NotebookEdit",
+                "Task",
+                "Agent",
+                "Workflow",
+                "TeamCreate",
+            ]
+            .into_iter()
+            .map(str::to_string)
+            .collect(),
+        );
+        let built = engine.build_command(&req, "codebuddy").unwrap();
+        let args: Vec<String> = built
+            .command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--disallowedTools"));
+        for (index, arg) in args.iter().enumerate() {
+            if matches!(
+                arg.as_str(),
+                "--tools"
+                    | "--allowedTools"
+                    | "--disallowedTools"
+                    | "--model"
+                    | "--effort"
+                    | "--permission-mode"
+            ) {
+                let next = args
+                    .get(index + 1)
+                    .unwrap_or_else(|| panic!("{arg} has no value"));
+                assert!(
+                    !next.starts_with('-'),
+                    "{arg} swallowed the next flag: {next}"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn blank_allowed_tools_falls_back_to_permission_mode() {
+        let engine = CodeBuddyEngine::new();
+        let mut req = sample_req();
+        req.allowed_tools = Some(vec!["  ".to_string(), String::new()]);
+        let built = engine.build_command(&req, "codebuddy").unwrap();
+        let args: Vec<String> = built
+            .command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
+        assert!(!args.iter().any(|a| a == "--tools"));
+        assert!(args.iter().any(|a| a == "--permission-mode"));
+        assert!(args.iter().any(|a| a == "auto"));
     }
 
     #[test]

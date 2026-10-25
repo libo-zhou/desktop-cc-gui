@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react";
+import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import LogIn from "lucide-react/dist/esm/icons/log-in";
@@ -13,6 +13,12 @@ import { Badge } from "./CliChannelRow";
 import { ipc, type CodeBuddyAccountStatus } from "@/lib/ipc";
 import { launchCodeBuddyLogin } from "./codebuddyLogin";
 
+interface AccountView {
+  loggedIn: boolean;
+  title: string;
+  description: string;
+}
+
 export function CodeBuddyAuthSection() {
   const { t } = useTranslation();
   const navigate = useNavigate();
@@ -20,12 +26,15 @@ export function CodeBuddyAuthSection() {
   const [refreshing, setRefreshing] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
+  // The probe result is cached server-side; after the interactive /login flow
+  // the next focus probe must bypass that cache or it reports the pre-login
+  // state for up to the TTL.
+  const forceNextProbe = useRef(false);
 
-  const fetchStatus = useCallback(async () => {
+  const fetchStatus = useCallback(async (force = false) => {
     setRefreshing(true);
     try {
-      const res = await ipc.codebuddyAccountStatus();
-      setStatus(res);
+      setStatus(await ipc.codebuddyAccountStatus(force));
     } catch {
       setStatus(null);
     } finally {
@@ -35,24 +44,55 @@ export function CodeBuddyAuthSection() {
 
   useEffect(() => {
     void fetchStatus();
-    window.addEventListener("focus", fetchStatus);
-    return () => window.removeEventListener("focus", fetchStatus);
+    const onFocus = () => {
+      const force = forceNextProbe.current;
+      forceNextProbe.current = false;
+      void fetchStatus(force);
+    };
+    window.addEventListener("focus", onFocus);
+    return () => window.removeEventListener("focus", onFocus);
   }, [fetchStatus]);
 
+  const account = useMemo<AccountView | null>(() => {
+    if (!status) return null; // probe pending / failed: say so, don't claim "not logged in"
+    if (!status.loggedIn) {
+      // A negative probe is "unknown", not proof of being logged out: the
+      // credential-store service names are guesses.
+      return {
+        loggedIn: false,
+        title: t("settings.codebuddyAccountUnknown"),
+        description: t("settings.codebuddyAccountUnknownDesc"),
+      };
+    }
+    return {
+      loggedIn: true,
+      title: t("settings.codebuddyAccountLoggedIn"),
+      description: t("settings.codebuddyAccountReady"),
+    };
+  }, [status, t]);
+
   // The CLI owns the interactive login flow: close the settings overlay so
-  // the user sees the terminal the login runs in. No workspace means no
-  // terminal to host it — say so instead of failing silently.
+  // the user sees the terminal the login runs in.
   const handleLaunchLogin = useCallback(async () => {
     if (launching) return;
     setLaunching(true);
     setNotice(null);
     try {
-      const launched = await launchCodeBuddyLogin();
-      if (launched) {
+      const result = await launchCodeBuddyLogin();
+      if (result.ok) {
+        forceNextProbe.current = true;
         navigate("/");
       } else {
-        setNotice(t("settings.piAuthLoginNoWorkspace"));
+        setNotice(
+          t(
+            result.reason === "no-workspace"
+              ? "settings.codebuddyLoginNoWorkspace"
+              : "settings.codebuddyLoginFailed",
+          ),
+        );
       }
+    } catch {
+      setNotice(t("settings.codebuddyLoginFailed"));
     } finally {
       setLaunching(false);
     }
@@ -77,7 +117,7 @@ export function CodeBuddyAuthSection() {
           size="small"
           leadingIcon={RefreshCw}
           disabled={refreshing}
-          onClick={() => void fetchStatus()}
+          onClick={() => void fetchStatus(true)}
         >
           {t("settings.codebuddyAccountRefresh")}
         </Button>
@@ -86,7 +126,7 @@ export function CodeBuddyAuthSection() {
       <SettingsCard>
         <div className="flex items-center gap-3 px-4 py-3.5">
           <div className="flex size-9 shrink-0 items-center justify-center rounded-lg bg-background-secondary-default text-foreground-icon-primary">
-            {status?.loggedIn ? (
+            {account?.loggedIn ? (
               <UserCheck className="size-5 text-text-brand" />
             ) : (
               <LogIn className="size-5 text-text-tertiary" />
@@ -95,38 +135,24 @@ export function CodeBuddyAuthSection() {
           <div className="flex min-w-0 flex-1 flex-col">
             <div className="flex items-center gap-2">
               <span className="truncate text-body-medium text-text-primary">
-                {status?.loggedIn
-                  ? status.displayName || status.enterpriseName || t("settings.codebuddyAccountLoggedIn")
-                  : status?.detection === "unknown"
-                    ? t("settings.codebuddyAccountUnknown")
-                    : t("settings.codebuddyAccountNotLoggedIn")}
+                {account?.title ?? t("settings.codebuddyAccountChecking")}
               </span>
-              {status?.loggedIn ? (
-                <Badge tone="default">{status.enterpriseName || t("settings.codebuddyAccountLoggedIn")}</Badge>
-              ) : (
-                <Badge tone="default">
-                  {status?.detection === "unknown"
-                    ? t("settings.codebuddyAccountUnknown")
-                    : t("settings.codebuddyAccountNotLoggedIn")}
-                </Badge>
+              {account?.loggedIn && (
+                <Badge tone="default">{t("settings.codebuddyAccountLoggedIn")}</Badge>
               )}
             </div>
             <p className="truncate text-body-2-regular text-text-secondary">
-              {status?.loggedIn
-                ? `${status.enterpriseName ? `${status.enterpriseName} · ` : ""}${status.uid ? `UID: ${status.uid}` : t("settings.codebuddyAccountReady")}`
-                : status?.detection === "unknown"
-                  ? t("settings.codebuddyAccountUnknownDesc")
-                  : t("settings.codebuddyAccountDesc")}
+              {account?.description ?? t("settings.codebuddyAccountCheckingDesc")}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">
             <Button
-              variant={status?.loggedIn ? "secondary" : "primary"}
+              variant={account?.loggedIn ? "secondary" : "primary"}
               size="small"
               disabled={launching}
               onClick={() => void handleLaunchLogin()}
             >
-              {status?.loggedIn
+              {account?.loggedIn
                 ? t("settings.codebuddyAccountRelogin")
                 : t("settings.codebuddyAccountLogin")}
             </Button>

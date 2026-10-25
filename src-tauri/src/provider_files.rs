@@ -611,20 +611,35 @@ pub(crate) fn channel_env(
         // authenticates against the wrong service and fails with 401. Derive
         // the two derivable editions from the channel's baseUrl; raw env
         // still wins (checked above) for the editions we cannot infer.
-        if let Some(base) = out.get("CODEBUDDY_BASE_URL").map(|s| s.to_lowercase()) {
-            let edition = if base.contains("tencent.sso.copilot.tencent.com") {
-                Some("ioa")
-            } else if base.contains("copilot.tencent.com") {
-                Some("internal")
-            } else {
-                None
-            };
-            if let Some(edition) = edition {
-                out.insert("CODEBUDDY_INTERNET_ENVIRONMENT".to_string(), edition.to_string());
-            }
+        if let Some(edition) = out
+            .get("CODEBUDDY_BASE_URL")
+            .and_then(|base| codebuddy_edition_for(base))
+        {
+            out.insert("CODEBUDDY_INTERNET_ENVIRONMENT".to_string(), edition.to_string());
         }
     }
     Ok(out)
+}
+
+/// CodeBuddy edition inferred from a channel base URL; `None` when it cannot
+/// be derived. Match the parsed host exactly: a bare `contains` also matched
+/// look-alike domains (`copilot.tencent.com.example.org`) and proxy URLs
+/// (`https://gateway.corp/https://copilot.tencent.com/v1`), silently pinning
+/// them to the wrong auth/endpoint family — the very 401 this derivation is
+/// meant to prevent.
+fn codebuddy_edition_for(base_url: &str) -> Option<&'static str> {
+    let (_, rest) = base_url.split_once("://")?;
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
+    let host_port = authority.rsplit('@').next().unwrap_or(authority);
+    let host = host_port
+        .split_once(':')
+        .map(|(host, _)| host)
+        .unwrap_or(host_port);
+    match host.to_ascii_lowercase().as_str() {
+        "tencent.sso.copilot.tencent.com" => Some("ioa"),
+        "copilot.tencent.com" => Some("internal"),
+        _ => None,
+    }
 }
 
 // ── claude: settings.json ───────────────────────────────────────────────────
@@ -1244,6 +1259,32 @@ mod tests {
         });
         let env = channel_env("codebuddy", &other).unwrap();
         assert!(!env.contains_key("CODEBUDDY_INTERNET_ENVIRONMENT"));
+
+        // Look-alike domain and a proxy path carrying the real host must not
+        // be mistaken for the Tencent endpoint: a contains() match silently
+        // pinned both to "internal".
+        for base in [
+            "https://copilot.tencent.com.example.org/v1",
+            "https://gateway.corp/https://copilot.tencent.com/v1",
+        ] {
+            let lookalike = serde_json::json!({ "baseUrl": base, "apiKey": "sk-z" });
+            let env = channel_env("codebuddy", &lookalike).unwrap();
+            assert!(
+                !env.contains_key("CODEBUDDY_INTERNET_ENVIRONMENT"),
+                "{base} must not derive an edition"
+            );
+        }
+
+        // A port on the real host still matches.
+        let port = serde_json::json!({
+            "baseUrl": "https://copilot.tencent.com:8443/v1",
+            "apiKey": "sk-p",
+        });
+        let env = channel_env("codebuddy", &port).unwrap();
+        assert_eq!(
+            env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
+            Some("internal")
+        );
     }
 
     #[test]

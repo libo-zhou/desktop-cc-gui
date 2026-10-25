@@ -1,8 +1,8 @@
 use super::discovery::{
-    codex_candidates, discover_agy, discover_claude, discover_codebuddy, discover_grok,
-    discover_kimi, discover_minimax, discover_opencode, discover_qoder, dsh_candidates,
-    identify_head, is_codex_subagent_file, is_dsh_subagent_file, opencode_db_visible_sessions,
-    path_is_under, pi_family_candidates,
+    codebuddy_transcripts, codex_candidates, discover_agy, discover_claude, discover_codebuddy_in,
+    discover_grok, discover_kimi, discover_minimax, discover_opencode, discover_qoder,
+    dsh_candidates, identify_head, is_codex_subagent_file, is_dsh_subagent_file,
+    opencode_db_visible_sessions, path_is_under, pi_family_candidates,
 };
 use super::{same_or_child, scan_summary_file, split_opencode_db_path, stat_signature, ScanSummary};
 use serde::Serialize;
@@ -81,6 +81,10 @@ pub(super) fn scan_with_guard(
 fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
     let mut candidates: Vec<Candidate> = Vec::new();
     let mut seen_paths: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    // CodeBuddy project dirs are CLI-private, so attribution needs each
+    // transcript's recorded cwd: read the heads once per scan, not once per
+    // workspace (O(workspaces × transcripts) before).
+    let codebuddy = codebuddy_transcripts();
     for workspace_path in workspaces {
         let workspace = PathBuf::from(workspace_path);
         // Filename/index-keyed engines identify cheaply per workspace.
@@ -99,7 +103,7 @@ fn gather_candidates(workspaces: &[String]) -> Vec<Candidate> {
                 crate::engine::qoder::QoderDistribution::Cn,
             ))
             .chain(discover_opencode(&workspace))
-            .chain(discover_codebuddy(&workspace))
+            .chain(discover_codebuddy_in(&codebuddy, &workspace))
         {
             if seen_paths.insert(file.file_path.clone()) {
                 candidates.push(Candidate {

@@ -1,5 +1,4 @@
 use super::{run_probe, EngineCatalog, EngineModel};
-use std::path::PathBuf;
 
 pub(super) async fn codebuddy_catalog(bin: &str) -> EngineCatalog {
     let default_model = read_configured_default_model();
@@ -38,19 +37,15 @@ pub(super) async fn codebuddy_catalog(bin: &str) -> EngineCatalog {
     }
 }
 
-fn codebuddy_config_dir() -> Option<PathBuf> {
-    if let Some(dir) = std::env::var_os("CODEBUDDY_CONFIG_DIR") {
-        if !dir.is_empty() {
-            return Some(PathBuf::from(dir));
-        }
-    }
-    // No home dir (some containers/service accounts): degrade to "no
-    // configured default model" instead of panicking inside an IPC command.
-    dirs::home_dir().map(|home| home.join(".codebuddy"))
+fn codebuddy_config_dir() -> std::path::PathBuf {
+    // Same resolver as history/MCP (engine_home): expands `~`, and under
+    // `cfg(test)` honors the HOME the tests set. A local copy ignored both, so
+    // a relocated config dir was found by history/MCP but not here.
+    crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy")
 }
 
 fn read_configured_default_model() -> Option<String> {
-    let dir = codebuddy_config_dir()?;
+    let dir = codebuddy_config_dir();
     for name in ["settings.local.json", "settings.json"] {
         if let Ok(content) = std::fs::read_to_string(dir.join(name)) {
             if let Ok(v) = serde_json::from_str::<serde_json::Value>(&content) {

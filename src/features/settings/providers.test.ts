@@ -43,7 +43,7 @@ describe("providerFamilyModels", () => {
 
   it("ignores blank values and non-claude engines", () => {
     expect(
-      providerFamilyModels("claude", channel({ ANTHROPIC_DEFAULT_NINE_MODEL: "  " })),
+      providerFamilyModels("claude", channel({ ANTHROPIC_DEFAULT_OPUS_MODEL: "  " })),
     ).toEqual({});
     expect(
       providerFamilyModels("codex", channel({ ANTHROPIC_DEFAULT_OPUS_MODEL: "x" })),
@@ -52,9 +52,9 @@ describe("providerFamilyModels", () => {
 });
 
 describe("stripConventionEnv", () => {
-  it("keeps CODEBUDDY_INTERNET_ENVIRONMENT when editing an imported channel", () => {
-    // cc-switch-imported cloudhosted/selfhosted channels carry this key; the
-    // channel form has no 网络环境 field, so stripping it would lose the
+  it("keeps CODEBUDDY_INTERNET_ENVIRONMENT when editing an env-configured channel", () => {
+    // A hand-edited channel (or a future cc-switch import) carries this key;
+    // the channel form has no 网络环境 field, so stripping it would lose the
     // enterprise environment on any edit (the backend cannot derive it for
     // custom domains, and the wrong environment 401s per official docs).
     const stripped = stripConventionEnv("codebuddy", {
