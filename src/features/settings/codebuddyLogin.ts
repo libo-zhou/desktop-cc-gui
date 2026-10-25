@@ -56,10 +56,13 @@ async function waitForCliReady(
 
 /**
  * Open the terminal dock on a fresh tab and start CodeBuddy login flow.
- * Returns false when there is no active workspace to host the terminal.
+ * Falls back to the first known workspace when no chat tab is active (fresh
+ * app launch). Returns false when there is no workspace to host the terminal.
  */
 export async function launchCodeBuddyLogin(): Promise<boolean> {
-  const workspacePath = useChatStore.getState().active?.workspacePath;
+  const state = useChatStore.getState();
+  const workspacePath =
+    state.active?.workspacePath ?? state.workspaces[0]?.path;
   if (!workspacePath) return false;
 
   const term = useTerminalStore.getState();

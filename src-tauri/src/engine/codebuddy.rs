@@ -13,114 +13,101 @@ pub struct CodeBuddyAccountStatus {
     pub enterprise_name: Option<String>,
 }
 
-fn status_from_account(account: &serde_json::Value) -> CodeBuddyAccountStatus {
-    let uid = account.get("uid").and_then(|v| v.as_str()).map(str::to_string);
-    let display_name = account
-        .get("displayName")
-        .or_else(|| account.get("enterpriseUserName"))
-        .or_else(|| account.get("nickname"))
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    let enterprise_name = account
-        .get("enterpriseName")
-        .and_then(|v| v.as_str())
-        .map(str::to_string);
-    CodeBuddyAccountStatus {
-        logged_in: true,
-        uid,
-        display_name,
-        enterprise_name,
+/// CodeBuddy stores CLI credentials in the OS credential manager per its
+/// official IAM docs (macOS Keychain, Windows Credential Manager, Linux
+/// keyring) — not in plain files under `~/.codebuddy`. Probing guessed
+/// filenames there misreported both directions: a successful terminal
+/// `/login` still showed "not logged in", while a stale/IDE-side file showed
+/// "logged in". Probe the real stores read-only, existence only, and never
+/// read secret values; the result is a bare boolean.
+fn cli_credentials_present() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        // `security find-generic-password` without `-w` reports existence
+        // only and never prints the secret. The exact service name is not
+        // publicly documented, so probe the plausible candidates.
+        ["codebuddy", "CodeBuddy", "com.tencent.codebuddy"]
+            .iter()
+            .any(|service| {
+                std::process::Command::new("security")
+                    .args(["find-generic-password", "-s", service])
+                    .stdout(std::process::Stdio::null())
+                    .stderr(std::process::Stdio::null())
+                    .status()
+                    .map(|status| status.success())
+                    .unwrap_or(false)
+            })
+    }
+    #[cfg(target_os = "windows")]
+    {
+        // `cmdkey /list` prints target names of stored credentials, never
+        // secrets.
+        std::process::Command::new("cmdkey")
+            .arg("/list")
+            .output()
+            .map(|out| {
+                String::from_utf8_lossy(&out.stdout)
+                    .to_lowercase()
+                    .contains("codebuddy")
+            })
+            .unwrap_or(false)
+    }
+    #[cfg(all(unix, not(target_os = "macos")))]
+    {
+        // `secret-tool search` exits non-zero when nothing matches; without
+        // `--unlock` it prints item attributes only, never the secret.
+        std::process::Command::new("secret-tool")
+            .args(["search", "service", "codebuddy"])
+            .stdout(std::process::Stdio::null())
+            .stderr(std::process::Stdio::null())
+            .status()
+            .map(|status| status.success())
+            .unwrap_or(false)
     }
 }
 
 pub fn check_codebuddy_account_status() -> CodeBuddyAccountStatus {
-    let mut candidates = Vec::new();
-
-    #[cfg(windows)]
-    if let Ok(appdata) = std::env::var("LOCALAPPDATA") {
-        candidates.push(
-            std::path::PathBuf::from(appdata)
-                .join("CodeBuddyExtension")
-                .join("Data")
-                .join("Public")
-                .join("auth")
-                .join("Tencent-Cloud.coding-copilot.info"),
-        );
+    CodeBuddyAccountStatus {
+        logged_in: cli_credentials_present(),
+        ..Default::default()
     }
-
-    if let Some(home) = dirs::home_dir() {
-        candidates.push(
-            home.join("Library")
-                .join("Application Support")
-                .join("CodeBuddyExtension")
-                .join("Data")
-                .join("Public")
-                .join("auth")
-                .join("Tencent-Cloud.coding-copilot.info"),
-        );
-        candidates.push(
-            home.join(".local")
-                .join("share")
-                .join("CodeBuddyExtension")
-                .join("Data")
-                .join("Public")
-                .join("auth")
-                .join("Tencent-Cloud.coding-copilot.info"),
-        );
-    }
-
-    for path in candidates {
-        if path.is_file() {
-            if let Ok(content) = std::fs::read_to_string(&path) {
-                if let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) {
-                    if let Some(account) = val.get("account") {
-                        return status_from_account(account);
-                    }
-                }
-            }
-        }
-    }
-
-    // CLI credential store: `codebuddy /login` in a terminal writes under the
-    // CLI's own config dir, not into the IDE extension directory above, so
-    // probing only the extension file would keep showing "not logged in"
-    // after a successful CLI login. Probe the credential filenames used by
-    // Claude-Code-compatible CLIs.
-    let cli_home = super::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy");
-    for name in [".credentials.json", "credentials.json", "auth.json"] {
-        let path = cli_home.join(name);
-        if !path.is_file() {
-            continue;
-        }
-        let Ok(content) = std::fs::read_to_string(&path) else {
-            continue;
-        };
-        let Ok(val) = serde_json::from_str::<serde_json::Value>(&content) else {
-            continue;
-        };
-        if let Some(account) = val.get("account") {
-            return status_from_account(account);
-        }
-        let has_token = ["accessToken", "access_token", "idToken", "id_token", "token"]
-            .iter()
-            .any(|key| match val.get(*key).and_then(|v| v.as_str()) {
-                Some(token) => !token.is_empty(),
-                None => false,
-            });
-        if has_token {
-            return CodeBuddyAccountStatus {
-                logged_in: true,
-                ..Default::default()
-            };
-        }
-    }
-
-    CodeBuddyAccountStatus::default()
 }
 
 #[tauri::command]
 pub async fn codebuddy_account_status() -> Result<CodeBuddyAccountStatus, String> {
     Ok(check_codebuddy_account_status())
+}
+
+/// Provider-selection env keys a codebuddy channel owns outright once a
+/// channel drives the launch. Like the claude adapter (claude_channel.rs),
+/// they are masked with empty strings in the `--settings` overlay so a stale
+/// key/endpoint in the user's native settings.json cannot silently override
+/// the channel: CodeBuddy applies settings.json `env` on top of the inherited
+/// process environment, and `--settings` has the CLI's highest precedence.
+const CHANNEL_SETTINGS_ENV_KEYS: &[&str] = &[
+    "CODEBUDDY_BASE_URL",
+    "CODEBUDDY_API_KEY",
+    "CODEBUDDY_MODEL",
+    "CODEBUDDY_INTERNET_ENVIRONMENT",
+];
+
+/// Route a selected channel through a `--settings '{"env":{...}}'` overlay
+/// (highest precedence) instead of relying on the inherited process env
+/// alone, which native settings.json would otherwise beat.
+pub(super) fn apply_channel(
+    built: &mut BuiltCommand,
+    env: &std::collections::HashMap<String, String>,
+) -> Result<(), String> {
+    let mut overlay = serde_json::Map::new();
+    for key in CHANNEL_SETTINGS_ENV_KEYS {
+        overlay.insert(key.to_string(), serde_json::Value::String(String::new()));
+    }
+    for (key, value) in env {
+        overlay.insert(key.clone(), serde_json::Value::String(value.clone()));
+    }
+    let settings = serde_json::json!({ "env": overlay });
+    built.command.arg("--settings").arg(settings.to_string());
+    Ok(())
 }
 pub struct CodeBuddyEngine {
     inner: ClaudeEngine,
@@ -148,7 +135,11 @@ impl Engine for CodeBuddyEngine {
     }
 
     fn supported_permissions(&self) -> &'static [&'static str] {
-        &["auto", "manual", "plan", "bypass"]
+        // No "manual": CodeBuddy headless does not support
+        // --permission-prompt-tool, so a mode that promises "ask every time"
+        // would silently deny instead of asking. The picker greys out what
+        // is not listed here and falls back to "auto".
+        &["auto", "plan", "bypass"]
     }
 
     fn supports_tool_constraints(&self) -> bool {
@@ -199,7 +190,21 @@ impl Engine for CodeBuddyEngine {
                 cmd.arg(*tool);
             }
             cmd.arg("--disallowedTools");
-            for tool in ["Bash", "Edit", "Write", "NotebookEdit", "Task"] {
+            // CodeBuddy names differ from Claude's: PowerShell is the shell
+            // tool on Windows and Agent/Workflow/TeamCreate spawn sub-agents.
+            // Deny both families so a read-only whitelist stays read-only
+            // even when the user's settings.json permissions.allow lists them.
+            for tool in [
+                "Bash",
+                "PowerShell",
+                "Edit",
+                "Write",
+                "NotebookEdit",
+                "Task",
+                "Agent",
+                "Workflow",
+                "TeamCreate",
+            ] {
                 if !tools.iter().any(|allowed| allowed == tool) {
                     cmd.arg(tool);
                 }
@@ -212,7 +217,6 @@ impl Engine for CodeBuddyEngine {
                 mode => {
                     cmd.arg("--permission-mode");
                     cmd.arg(match mode {
-                        "manual" => "default",
                         "plan" => "plan",
                         _ => "acceptEdits",
                     });
@@ -320,7 +324,7 @@ mod tests {
         assert!(engine.supports_tool_constraints());
         assert_eq!(
             engine.supported_permissions(),
-            &["auto", "manual", "plan", "bypass"]
+            &["auto", "plan", "bypass"]
         );
     }
 
@@ -369,18 +373,109 @@ mod tests {
     }
 
     #[test]
+    fn read_only_whitelist_denies_shell_and_subagent_tools() {
+        let engine = CodeBuddyEngine::new();
+        let args_of = |allowed: Vec<String>| {
+            let mut req = sample_req();
+            req.allowed_tools = Some(allowed);
+            let built = engine.build_command(&req, "codebuddy").unwrap();
+            built
+                .command
+                .as_std()
+                .get_args()
+                .map(|a| a.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        };
+
+        let args = args_of(vec!["Read".to_string(), "Glob".to_string()]);
+        let denied = &args[args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .expect("--disallowedTools must be emitted")
+            + 1..];
+        // CodeBuddy's own tool names: PowerShell is the shell tool on
+        // Windows; Agent/Workflow/TeamCreate spawn sub-agents. A read-only
+        // whitelist must deny both the Claude-named and CodeBuddy-named
+        // write/exec/delegate tools.
+        for tool in [
+            "Bash",
+            "PowerShell",
+            "Edit",
+            "Write",
+            "NotebookEdit",
+            "Task",
+            "Agent",
+            "Workflow",
+            "TeamCreate",
+        ] {
+            assert!(
+                denied.iter().any(|a| a == tool),
+                "missing deny for {tool}"
+            );
+        }
+
+        // An explicitly allowed tool must not also be denied.
+        let args = args_of(vec!["Bash".to_string()]);
+        let denied = &args[args
+            .iter()
+            .position(|a| a == "--disallowedTools")
+            .unwrap()
+            + 1..];
+        assert!(!denied.iter().any(|a| a == "Bash"));
+    }
+
+    #[test]
+    fn channel_env_rides_settings_overlay_with_native_keys_masked() {
+        let mut built = BuiltCommand {
+            command: tokio::process::Command::new("codebuddy"),
+            stdin_payload: None,
+            keep_stdin_open: false,
+            cleanup_files: Vec::new(),
+            mcp_restore: None,
+            preassigned_session_id: None,
+        };
+        let env = std::collections::HashMap::from([
+            (
+                "CODEBUDDY_BASE_URL".to_string(),
+                "https://copilot.tencent.com".to_string(),
+            ),
+            ("CODEBUDDY_API_KEY".to_string(), "sk-test".to_string()),
+            (
+                "CODEBUDDY_INTERNET_ENVIRONMENT".to_string(),
+                "internal".to_string(),
+            ),
+        ]);
+        apply_channel(&mut built, &env).unwrap();
+        let args: Vec<_> = built.command.as_std().get_args().collect();
+        assert_eq!(args.len(), 2);
+        assert_eq!(args[0], "--settings");
+        let settings: serde_json::Value =
+            serde_json::from_str(args[1].to_str().unwrap()).unwrap();
+        assert_eq!(
+            settings["env"]["CODEBUDDY_BASE_URL"],
+            "https://copilot.tencent.com"
+        );
+        assert_eq!(settings["env"]["CODEBUDDY_API_KEY"], "sk-test");
+        assert_eq!(settings["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"], "internal");
+        // Convention keys the channel does not set are masked with empty
+        // strings, so a stale native settings.json value cannot win over the
+        // channel (--settings has the CLI's highest precedence).
+        assert_eq!(settings["env"]["CODEBUDDY_MODEL"], "");
+    }
+
+    #[test]
     fn parse_line_delegates_to_claude_parser() {
         let engine = CodeBuddyEngine::new();
         let mut out = Vec::new();
         let sample = r#"{"type":"assistant","uuid":"u1","session_id":"s1","message":{"id":"m1","content":[{"type":"text","text":"hello world"}],"model":"custom:kimi-k3","role":"assistant"}}"#;
         engine.parse_line(sample, &mut out);
-        assert_eq!(out.len(), 1);
-        match &out[0] {
-            EngineEvent::Message { role, text, .. } => {
-                assert_eq!(role, "assistant");
-                assert_eq!(text, "hello world");
-            }
-            other => panic!("expected EngineEvent::Message, got {other:?}"),
-        }
+        // An assistant snapshot surfaces the session id and the served model
+        // (message text arrives via stream_event lines, not this snapshot).
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, EngineEvent::SessionId(id) if id == "s1")));
+        assert!(out
+            .iter()
+            .any(|e| matches!(e, EngineEvent::Model(model) if model == "custom:kimi-k3")));
     }
 }

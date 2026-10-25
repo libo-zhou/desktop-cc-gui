@@ -604,6 +604,26 @@ pub(crate) fn channel_env(
             out.entry("XAI_API_KEY".into()).or_insert(key);
         }
     }
+    if engine == "codebuddy" && !seen.contains("CODEBUDDY_INTERNET_ENVIRONMENT") {
+        // CodeBuddy requires CODEBUDDY_INTERNET_ENVIRONMENT to pick the right
+        // auth/endpoint family (CN 中国版 "internal", iOA "ioa", 专属
+        // "cloudhosted", 自建 "selfhosted"); without it an API-Key channel
+        // authenticates against the wrong service and fails with 401. Derive
+        // the two derivable editions from the channel's baseUrl; raw env
+        // still wins (checked above) for the editions we cannot infer.
+        if let Some(base) = out.get("CODEBUDDY_BASE_URL").map(|s| s.to_lowercase()) {
+            let edition = if base.contains("tencent.sso.copilot.tencent.com") {
+                Some("ioa")
+            } else if base.contains("copilot.tencent.com") {
+                Some("internal")
+            } else {
+                None
+            };
+            if let Some(edition) = edition {
+                out.insert("CODEBUDDY_INTERNET_ENVIRONMENT".to_string(), edition.to_string());
+            }
+        }
+    }
     Ok(out)
 }
 
@@ -1178,6 +1198,52 @@ mod tests {
             env.get("OPENAI_API_KEY").map(String::as_str),
             Some("sk-codex")
         );
+    }
+
+    #[test]
+    fn channel_env_codebuddy_derives_internet_environment() {
+        // CN 中国版 endpoint → internal.
+        let cn = serde_json::json!({
+            "baseUrl": "https://copilot.tencent.com/v1",
+            "apiKey": "sk-cn",
+        });
+        let env = channel_env("codebuddy", &cn).unwrap();
+        assert_eq!(
+            env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
+            Some("internal")
+        );
+
+        // iOA endpoint → ioa (must win over the copilot.tencent.com suffix).
+        let ioa = serde_json::json!({
+            "baseUrl": "https://tencent.sso.copilot.tencent.com/v1",
+            "apiKey": "sk-ioa",
+        });
+        let env = channel_env("codebuddy", &ioa).unwrap();
+        assert_eq!(
+            env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
+            Some("ioa")
+        );
+
+        // Raw env wins over the derivation (专属 cloudhosted / 自建
+        // selfhosted cannot be inferred from the baseUrl).
+        let explicit = serde_json::json!({
+            "baseUrl": "https://copilot.tencent.com/v1",
+            "apiKey": "sk-x",
+            "env": { "CODEBUDDY_INTERNET_ENVIRONMENT": "cloudhosted" },
+        });
+        let env = channel_env("codebuddy", &explicit).unwrap();
+        assert_eq!(
+            env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
+            Some("cloudhosted")
+        );
+
+        // Unknown endpoint: no guess.
+        let other = serde_json::json!({
+            "baseUrl": "https://selfhosted.example.com",
+            "apiKey": "sk-y",
+        });
+        let env = channel_env("codebuddy", &other).unwrap();
+        assert!(!env.contains_key("CODEBUDDY_INTERNET_ENVIRONMENT"));
     }
 
     #[test]

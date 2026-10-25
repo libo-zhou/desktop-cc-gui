@@ -18,6 +18,8 @@ export function CodeBuddyAuthSection() {
   const navigate = useNavigate();
   const [status, setStatus] = useState<CodeBuddyAccountStatus | null>(null);
   const [refreshing, setRefreshing] = useState(false);
+  const [launching, setLaunching] = useState(false);
+  const [notice, setNotice] = useState<string | null>(null);
 
   const fetchStatus = useCallback(async () => {
     setRefreshing(true);
@@ -37,15 +39,32 @@ export function CodeBuddyAuthSection() {
     return () => window.removeEventListener("focus", fetchStatus);
   }, [fetchStatus]);
 
+  // The CLI owns the interactive login flow: close the settings overlay so
+  // the user sees the terminal the login runs in. No workspace means no
+  // terminal to host it — say so instead of failing silently.
   const handleLaunchLogin = useCallback(async () => {
-    const launched = await launchCodeBuddyLogin();
-    if (launched) {
-      navigate("/");
+    if (launching) return;
+    setLaunching(true);
+    setNotice(null);
+    try {
+      const launched = await launchCodeBuddyLogin();
+      if (launched) {
+        navigate("/");
+      } else {
+        setNotice(t("settings.piAuthLoginNoWorkspace"));
+      }
+    } finally {
+      setLaunching(false);
     }
-  }, [navigate]);
+  }, [launching, navigate, t]);
 
   return (
     <div className="flex w-full flex-col gap-2">
+      {notice && (
+        <p role="status" className="text-body-regular text-text-secondary">
+          {notice}
+        </p>
+      )}
       <div className="flex items-center justify-between gap-3">
         <SettingsSectionLabel anchor="codebuddyAuth">
           {t("settings.codebuddyAccountTitle")}
@@ -96,6 +115,7 @@ export function CodeBuddyAuthSection() {
             <Button
               variant={status?.loggedIn ? "secondary" : "primary"}
               size="small"
+              disabled={launching}
               onClick={() => void handleLaunchLogin()}
             >
               {status?.loggedIn

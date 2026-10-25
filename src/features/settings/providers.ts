@@ -122,7 +122,12 @@ const ENV_CONVENTION_KEYS: Partial<Record<EngineId, string[]>> = {
   kimi: ["KIMI_BASE_URL", "KIMI_API_KEY", "KIMI_MODEL_NAME"],
   grok: ["GROK_BASE_URL", "GROK_API_KEY", "GROK_MODEL"],
   codex: ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
-  codebuddy: ["CODEBUDDY_BASE_URL", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL"],
+  codebuddy: [
+    "CODEBUDDY_BASE_URL",
+    "CODEBUDDY_API_KEY",
+    "CODEBUDDY_MODEL",
+    "CODEBUDDY_INTERNET_ENVIRONMENT",
+  ],
 };
 
 /** Copy `raw` with the convention env keys removed (empty maps/objects
