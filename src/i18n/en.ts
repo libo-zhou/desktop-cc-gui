@@ -1170,6 +1170,9 @@ export const en: Messages = {
     codebuddyAccountRefresh: "Refresh Status",
     codebuddyAccountLoggedIn: "Logged In",
     codebuddyAccountNotLoggedIn: "Not Logged In",
+    codebuddyAccountUnknown: "Status Unknown",
+    codebuddyAccountUnknownDesc:
+      "Could not confirm login state in the OS credential store; if you already ran /login in a terminal, it works as-is",
     codebuddyAccountReady: "Credentials ready for chat",
     codebuddyAccountDesc: "Launch CodeBuddy in terminal for QR scan or SSO login",
     codebuddyAccountLogin: "Terminal Login",

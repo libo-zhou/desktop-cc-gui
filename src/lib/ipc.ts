@@ -409,6 +409,9 @@ export interface ProviderModelList {
 }
 export interface CodeBuddyAccountStatus {
   loggedIn: boolean;
+  /** "found" = credential store probe hit; "unknown" = the guessed service
+   *  names missed, which is not proof of being logged out. */
+  detection: "found" | "unknown";
   uid: string | null;
   displayName: string | null;
   enterpriseName: string | null;

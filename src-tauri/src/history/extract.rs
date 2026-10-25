@@ -95,7 +95,9 @@ type LineExtractor<'a> = Box<dyn Fn(&Value) -> LineRows + 'a>;
 fn extractor_for(engine: &str, images: ImageMode) -> LineExtractor<'static> {
     if engine == "dsh" {
         Box::new(extract_dsh_line)
-    } else if engine == "claude" || engine == "codebuddy" {
+    } else if engine == "codebuddy" {
+        Box::new(move |value| extract_codebuddy_line(value, images))
+    } else if engine == "claude" {
         // Local slash commands span several user lines. `Fn` extractors can't
         // capture `&mut`, so the window lives in a Cell across calls.
         let local_command = std::cell::Cell::new(false);
@@ -775,7 +777,8 @@ fn normalize_extracted_row(
 /// Per-engine NDJSON line -> zero or more (role, text, ts, usage, model) tuples.
 fn extract_line_messages(engine: &str, value: &Value, images: ImageMode) -> LineRows {
     match engine {
-        "claude" | "codebuddy" => extract_claude_line(value, images),
+        "claude" => extract_claude_line(value, images),
+        "codebuddy" => extract_codebuddy_line(value, images),
         "kimi" => extract_kimi_line(value),
         "grok" => extract_grok_line(value),
         "codex" => extract_codex_line(value, images),
@@ -1327,6 +1330,136 @@ fn extract_claude_line(value: &Value, images: ImageMode) -> LineRows {
                 });
             }
         }
+    }
+    out
+}
+
+// ==================== CodeBuddy ====================
+
+/// CodeBuddy transcripts are NOT Claude-shaped. Conversation lines are
+/// `{"type":"message","role":"user|assistant","content":[{"type":"input_text"|
+/// "output_text","text":...}],"sessionId":...,"cwd":...,"timestamp":<ms>}`
+/// (user parts are `input_text`, assistant parts `output_text`); tool
+/// activity arrives as `function_call` / `function_call_output` items (both
+/// top-level and, defensively, inside message content); `file-history-snapshot`
+/// and `ai-title` lines are CLI bookkeeping. Verified against real CLI
+/// v2.175.0 transcripts.
+fn extract_codebuddy_line(value: &Value, images: ImageMode) -> LineRows {
+    let ts = codebuddy_ts(value);
+    match type_str(value) {
+        "message" => codebuddy_message_rows(value, images, ts),
+        "function_call" => vec![codebuddy_tool_row(value, ts)],
+        "function_call_output" => codebuddy_tool_result_row(value, ts).into_iter().collect(),
+        _ => Vec::new(),
+    }
+}
+
+/// CodeBuddy stamps milliseconds-since-epoch (numeric); accept the stringly
+/// forms too so a schema tweak degrades instead of zeroing timestamps.
+fn codebuddy_ts(value: &Value) -> Option<String> {
+    for key in ["timestamp", "ts"] {
+        if let Some(n) = value.get(key).and_then(Value::as_i64) {
+            return Some(n.to_string());
+        }
+    }
+    ts_string(value, &["timestamp", "ts"])
+}
+
+fn codebuddy_call_id(value: &Value) -> Option<String> {
+    value
+        .get("call_id")
+        .or_else(|| value.get("callId"))
+        .or_else(|| value.get("id"))
+        .and_then(Value::as_str)
+        .map(str::to_string)
+}
+
+fn codebuddy_tool_row(value: &Value, ts: Option<String>) -> LineRow {
+    let name = value
+        .get("name")
+        .and_then(Value::as_str)
+        .unwrap_or("tool")
+        .to_string();
+    let args = value
+        .get("arguments")
+        .or_else(|| value.get("input"))
+        .and_then(crate::engine::parse_tool_args_value);
+    LineRow {
+        path: args.as_ref().and_then(crate::engine::tool_path_arg),
+        todos: args.as_ref().and_then(crate::engine::parse_todo_args),
+        args,
+        tool_call_id: codebuddy_call_id(value),
+        ..LineRow::new("tool", name, ts)
+    }
+}
+
+fn codebuddy_tool_result_row(value: &Value, ts: Option<String>) -> Option<LineRow> {
+    let result = value.get("output").or_else(|| value.get("result")).cloned();
+    result.map(|result| LineRow {
+        tool_call_id: codebuddy_call_id(value),
+        result: Some(result),
+        ..LineRow::new("__tool_result__", String::new(), ts)
+    })
+}
+
+fn codebuddy_message_rows(value: &Value, images: ImageMode, ts: Option<String>) -> LineRows {
+    let role = match value.get("role").and_then(Value::as_str) {
+        Some(role @ ("user" | "assistant")) => role,
+        _ => return Vec::new(),
+    };
+    let usage = value.get("usage").cloned();
+    let model = value
+        .get("model")
+        .and_then(Value::as_str)
+        .map(str::to_string);
+    let Some(blocks) = value.get("content").and_then(Value::as_array) else {
+        let text = content_text(value.get("content"));
+        return if text.trim().is_empty() {
+            Vec::new()
+        } else {
+            vec![LineRow {
+                usage,
+                model,
+                ..LineRow::new(role, text, ts)
+            }]
+        };
+    };
+    let mut out = Vec::new();
+    let mut text = String::new();
+    let mut collected: Vec<String> = Vec::new();
+    for block in blocks {
+        match block.get("type").and_then(Value::as_str) {
+            Some("input_text") | Some("output_text") | Some("text") => {
+                if let Some(t) = block.get("text").and_then(Value::as_str) {
+                    text.push_str(t);
+                }
+            }
+            Some("input_image") => {
+                if images == ImageMode::Collect {
+                    if let Some(url) = block.get("image_url").and_then(Value::as_str) {
+                        collected.push(url.to_string());
+                    }
+                }
+            }
+            Some("function_call") => out.push(codebuddy_tool_row(block, ts.clone())),
+            Some("function_call_output") => {
+                out.extend(codebuddy_tool_result_row(block, ts.clone()))
+            }
+            _ => {}
+        }
+    }
+    if !text.trim().is_empty() {
+        out.push(LineRow {
+            usage,
+            model,
+            images: collected,
+            ..LineRow::new(role, text, ts)
+        });
+    } else if !collected.is_empty() {
+        out.push(LineRow {
+            images: collected,
+            ..LineRow::new(role, String::new(), ts)
+        });
     }
     out
 }
@@ -2628,6 +2761,90 @@ mod tests {
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].text, "see this");
         assert_eq!(rows[0].images, ["data:image/png;base64,aGk="]);
+    }
+
+    /// Real CLI v2.175.0 transcript schema: message lines with input_text /
+    /// output_text parts, top-level function_call / function_call_output,
+    /// file-history-snapshot / ai-title bookkeeping, ms epoch timestamps.
+    fn codebuddy_fixture_file(tag: &str) -> PathBuf {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-codebuddy-extract-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let file = dir.join("sess-1.jsonl");
+        std::fs::write(
+            &file,
+            concat!(
+                "{\"type\":\"file-history-snapshot\",\"messageId\":\"m0\",\"snapshot\":{}}\n",
+                "{\"type\":\"ai-title\",\"title\":\"会话标题\"}\n",
+                "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"帮我看看这个文件\"}],\"sessionId\":\"sess-1\",\"cwd\":\"/tmp/ws\",\"timestamp\":1761200000000}\n",
+                "{\"type\":\"message\",\"role\":\"assistant\",\"content\":[{\"type\":\"output_text\",\"text\":\"好的，先读一下\"}],\"sessionId\":\"sess-1\",\"cwd\":\"/tmp/ws\",\"timestamp\":1761200001000,\"model\":\"hy4-preview\",\"usage\":{\"input_tokens\":12,\"output_tokens\":3}}\n",
+                "{\"type\":\"function_call\",\"name\":\"Read\",\"arguments\":\"{\\\"path\\\":\\\"/tmp/ws/a.rs\\\"}\",\"call_id\":\"call-1\",\"timestamp\":1761200001500}\n",
+                "{\"type\":\"function_call_output\",\"call_id\":\"call-1\",\"output\":\"file bytes\",\"timestamp\":1761200002000}\n",
+                "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"再看这张图\"},{\"type\":\"input_image\",\"image_url\":\"data:image/png;base64,aGk=\"}],\"sessionId\":\"sess-1\",\"cwd\":\"/tmp/ws\",\"timestamp\":1761200003000}\n",
+            ),
+        )
+        .unwrap();
+        file
+    }
+
+    #[test]
+    fn codebuddy_transcript_parses_messages_tools_and_images() {
+        let file = codebuddy_fixture_file("parse");
+        let parsed = parse_session_file("codebuddy", &file, &HashSet::new()).unwrap();
+        let roles: Vec<&str> = parsed.messages.iter().map(|m| m.role.as_str()).collect();
+        assert_eq!(roles, ["user", "assistant", "tool", "user"]);
+
+        let user = &parsed.messages[0];
+        assert_eq!(user.text, "帮我看看这个文件");
+        assert_eq!(user.ts.as_deref(), Some("1761200000000"));
+
+        let assistant = &parsed.messages[1];
+        assert_eq!(assistant.text, "好的，先读一下");
+        assert_eq!(assistant.model.as_deref(), Some("hy4-preview"));
+        assert_eq!(
+            assistant.usage.as_ref().unwrap()["input_tokens"],
+            serde_json::json!(12)
+        );
+
+        let tool = &parsed.messages[2];
+        assert_eq!(tool.text, "Read");
+        assert_eq!(tool.path.as_deref(), Some("/tmp/ws/a.rs"));
+        // function_call_output pairs back onto its call by call_id.
+        assert_eq!(
+            tool.result.as_ref().unwrap(),
+            &serde_json::json!("file bytes")
+        );
+
+        let image_turn = &parsed.messages[3];
+        assert_eq!(image_turn.text, "再看这张图");
+        assert_eq!(image_turn.images, ["data:image/png;base64,aGk="]);
+
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn codebuddy_scan_summary_uses_first_user_text_and_ms_timestamps() {
+        let file = codebuddy_fixture_file("scan");
+        let summary = scan_summary_file("codebuddy", &file, &HashSet::new()).unwrap();
+        assert_eq!(summary.title, "帮我看看这个文件");
+        assert_eq!(summary.preview, "好的，先读一下");
+        assert_eq!(summary.message_count, 4);
+        assert_eq!(summary.first_ts, Some(1761200000000));
+        assert_eq!(summary.last_ts, Some(1761200003000));
+        std::fs::remove_dir_all(file.parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn codebuddy_skips_bookkeeping_lines() {
+        for line in [
+            serde_json::json!({"type": "file-history-snapshot", "messageId": "m0", "snapshot": {}}),
+            serde_json::json!({"type": "ai-title", "title": "t"}),
+            serde_json::json!({"type": "message", "role": "system", "content": [{"type": "output_text", "text": "sys"}]}),
+        ] {
+            assert!(extract_codebuddy_line(&line, ImageMode::Collect).is_empty());
+        }
     }
 
     #[test]

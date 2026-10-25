@@ -122,12 +122,10 @@ const ENV_CONVENTION_KEYS: Partial<Record<EngineId, string[]>> = {
   kimi: ["KIMI_BASE_URL", "KIMI_API_KEY", "KIMI_MODEL_NAME"],
   grok: ["GROK_BASE_URL", "GROK_API_KEY", "GROK_MODEL"],
   codex: ["OPENAI_BASE_URL", "OPENAI_API_KEY"],
-  codebuddy: [
-    "CODEBUDDY_BASE_URL",
-    "CODEBUDDY_API_KEY",
-    "CODEBUDDY_MODEL",
-    "CODEBUDDY_INTERNET_ENVIRONMENT",
-  ],
+  // CODEBUDDY_INTERNET_ENVIRONMENT is deliberately NOT here: the channel form
+  // has no 网络环境 field, so stripping it would permanently delete the key
+  // from cc-switch-imported cloudhosted/selfhosted channels on any edit.
+  codebuddy: ["CODEBUDDY_BASE_URL", "CODEBUDDY_API_KEY", "CODEBUDDY_MODEL"],
 };
 
 /** Copy `raw` with the convention env keys removed (empty maps/objects

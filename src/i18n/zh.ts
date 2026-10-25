@@ -1125,6 +1125,8 @@ export const zh = {
     codebuddyAccountRefresh: "刷新状态",
     codebuddyAccountLoggedIn: "已登录",
     codebuddyAccountNotLoggedIn: "未登录账号",
+    codebuddyAccountUnknown: "状态未知",
+    codebuddyAccountUnknownDesc: "无法确认系统凭据存储中的登录状态；若已在终端 /login，可直接使用",
     codebuddyAccountReady: "凭证有效，可直接对话",
     codebuddyAccountDesc: "在终端中唤起 CodeBuddy 进行扫码或 SSO 认证",
     codebuddyAccountLogin: "终端登录",

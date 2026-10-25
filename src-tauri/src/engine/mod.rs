@@ -656,7 +656,11 @@ fn prepare_launch(
         ("claude", Some(provider)) => {
             claude_channel::apply(&mut built, provider, &channel_env, &req)
         }
-        ("codebuddy", Some(_)) => codebuddy::apply_channel(&mut built, &channel_env),
+        ("codebuddy", Some(_)) => codebuddy::apply_channel(
+            &mut built,
+            &channel_env,
+            &crate::paths::app_home().join("codebuddy-staging"),
+        ),
         ("kimi", Some(_)) => kimi::apply_channel(&mut built.command, &channel_env, &req),
         ("codex", Some(provider)) => {
             codex::apply_channel(&mut built.command, provider, &channel_env, &req)

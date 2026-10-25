@@ -97,18 +97,26 @@ export function CodeBuddyAuthSection() {
               <span className="truncate text-body-medium text-text-primary">
                 {status?.loggedIn
                   ? status.displayName || status.enterpriseName || t("settings.codebuddyAccountLoggedIn")
-                  : t("settings.codebuddyAccountNotLoggedIn")}
+                  : status?.detection === "unknown"
+                    ? t("settings.codebuddyAccountUnknown")
+                    : t("settings.codebuddyAccountNotLoggedIn")}
               </span>
               {status?.loggedIn ? (
                 <Badge tone="default">{status.enterpriseName || t("settings.codebuddyAccountLoggedIn")}</Badge>
               ) : (
-                <Badge tone="default">{t("settings.codebuddyAccountNotLoggedIn")}</Badge>
+                <Badge tone="default">
+                  {status?.detection === "unknown"
+                    ? t("settings.codebuddyAccountUnknown")
+                    : t("settings.codebuddyAccountNotLoggedIn")}
+                </Badge>
               )}
             </div>
             <p className="truncate text-body-2-regular text-text-secondary">
               {status?.loggedIn
                 ? `${status.enterpriseName ? `${status.enterpriseName} · ` : ""}${status.uid ? `UID: ${status.uid}` : t("settings.codebuddyAccountReady")}`
-                : t("settings.codebuddyAccountDesc")}
+                : status?.detection === "unknown"
+                  ? t("settings.codebuddyAccountUnknownDesc")
+                  : t("settings.codebuddyAccountDesc")}
             </p>
           </div>
           <div className="flex shrink-0 items-center gap-2">

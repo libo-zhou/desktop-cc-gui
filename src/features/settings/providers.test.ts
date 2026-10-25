@@ -1,5 +1,5 @@
 import { describe, expect, it } from "vitest";
-import { familyAliasOfEnvKey, providerFamilyModels } from "./providers";
+import { familyAliasOfEnvKey, providerFamilyModels, stripConventionEnv } from "./providers";
 
 describe("familyAliasOfEnvKey", () => {
   it("derives the alias id from the CLI's family env key shape", () => {
@@ -43,10 +43,33 @@ describe("providerFamilyModels", () => {
 
   it("ignores blank values and non-claude engines", () => {
     expect(
-      providerFamilyModels("claude", channel({ ANTHROPIC_DEFAULT_OPUS_MODEL: "  " })),
+      providerFamilyModels("claude", channel({ ANTHROPIC_DEFAULT_NINE_MODEL: "  " })),
     ).toEqual({});
     expect(
       providerFamilyModels("codex", channel({ ANTHROPIC_DEFAULT_OPUS_MODEL: "x" })),
     ).toEqual({});
+  });
+});
+
+describe("stripConventionEnv", () => {
+  it("keeps CODEBUDDY_INTERNET_ENVIRONMENT when editing an imported channel", () => {
+    // cc-switch-imported cloudhosted/selfhosted channels carry this key; the
+    // channel form has no 网络环境 field, so stripping it would lose the
+    // enterprise environment on any edit (the backend cannot derive it for
+    // custom domains, and the wrong environment 401s per official docs).
+    const stripped = stripConventionEnv("codebuddy", {
+      env: { CODEBUDDY_INTERNET_ENVIRONMENT: "cloudhosted" },
+      settingsConfig: {
+        env: {
+          CODEBUDDY_BASE_URL: "https://company.copilot.qq.com",
+          CODEBUDDY_API_KEY: "sk-x",
+          CODEBUDDY_INTERNET_ENVIRONMENT: "cloudhosted",
+        },
+      },
+    });
+    expect(stripped.env).toEqual({ CODEBUDDY_INTERNET_ENVIRONMENT: "cloudhosted" });
+    expect(stripped.settingsConfig).toEqual({
+      env: { CODEBUDDY_INTERNET_ENVIRONMENT: "cloudhosted" },
+    });
   });
 });

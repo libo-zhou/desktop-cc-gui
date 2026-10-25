@@ -8,6 +8,11 @@ use serde::Serialize;
 #[serde(rename_all = "camelCase")]
 pub struct CodeBuddyAccountStatus {
     pub logged_in: bool,
+    /// The probed credential service names are guesses (the CLI's exact
+    /// Keychain/Credential Manager/keyring names are not publicly
+    /// documented), so a negative probe is "unknown", not "logged out".
+    /// Only a positive probe is conclusive.
+    pub detection: &'static str,
     pub uid: Option<String>,
     pub display_name: Option<String>,
     pub enterprise_name: Option<String>,
@@ -67,15 +72,41 @@ fn cli_credentials_present() -> bool {
 }
 
 pub fn check_codebuddy_account_status() -> CodeBuddyAccountStatus {
+    let logged_in = cli_credentials_present();
     CodeBuddyAccountStatus {
-        logged_in: cli_credentials_present(),
+        logged_in,
+        // The probed service names are guesses: a hit proves "logged in",
+        // a miss only means "not found under the names we tried".
+        detection: if logged_in { "found" } else { "unknown" },
         ..Default::default()
     }
 }
 
+/// The settings page re-probes on every window focus, and each probe spawns
+/// up to three credential-store processes. Cache the result briefly: login
+/// state changes on a minutes scale, not a focus-Event scale.
+const ACCOUNT_STATUS_CACHE_TTL: std::time::Duration = std::time::Duration::from_secs(30);
+
 #[tauri::command]
 pub async fn codebuddy_account_status() -> Result<CodeBuddyAccountStatus, String> {
-    Ok(check_codebuddy_account_status())
+    static CACHE: std::sync::Mutex<
+        Option<(std::time::Instant, CodeBuddyAccountStatus)>,
+    > = std::sync::Mutex::new(None);
+    {
+        let cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+        if let Some((at, status)) = cache.as_ref() {
+            if at.elapsed() < ACCOUNT_STATUS_CACHE_TTL {
+                return Ok(status.clone());
+            }
+        }
+    }
+    // The probes spawn child processes; keep them off the async runtime.
+    let status = tokio::task::spawn_blocking(check_codebuddy_account_status)
+        .await
+        .map_err(|e| format!("codebuddy account probe: {e}"))?;
+    let mut cache = CACHE.lock().unwrap_or_else(|e| e.into_inner());
+    *cache = Some((std::time::Instant::now(), status.clone()));
+    Ok(status)
 }
 
 /// Provider-selection env keys a codebuddy channel owns outright once a
@@ -91,12 +122,19 @@ const CHANNEL_SETTINGS_ENV_KEYS: &[&str] = &[
     "CODEBUDDY_INTERNET_ENVIRONMENT",
 ];
 
-/// Route a selected channel through a `--settings '{"env":{...}}'` overlay
-/// (highest precedence) instead of relying on the inherited process env
-/// alone, which native settings.json would otherwise beat.
+/// Route a selected channel through a `--settings <path>` overlay (highest
+/// precedence) instead of relying on the inherited process env alone, which
+/// native settings.json would otherwise beat.
+///
+/// The overlay carries CODEBUDDY_API_KEY, so it is staged in a private
+/// 0600 file (mirroring claude_channel::stage) rather than inlined on argv —
+/// an inline JSON would expose the key to `ps`, /proc/<pid>/cmdline, and
+/// diagnostic collectors for the process's whole lifetime. The file is
+/// removed via cleanup_files once the child exits.
 pub(super) fn apply_channel(
     built: &mut BuiltCommand,
     env: &std::collections::HashMap<String, String>,
+    directory: &std::path::Path,
 ) -> Result<(), String> {
     let mut overlay = serde_json::Map::new();
     for key in CHANNEL_SETTINGS_ENV_KEYS {
@@ -106,7 +144,34 @@ pub(super) fn apply_channel(
         overlay.insert(key.clone(), serde_json::Value::String(value.clone()));
     }
     let settings = serde_json::json!({ "env": overlay });
-    built.command.arg("--settings").arg(settings.to_string());
+    stage_overlay(built, &settings, directory)
+}
+
+fn stage_overlay(
+    built: &mut BuiltCommand,
+    settings: &serde_json::Value,
+    directory: &std::path::Path,
+) -> Result<(), String> {
+    let content = serde_json::to_vec(settings)
+        .map_err(|_| "Cannot serialize CodeBuddy channel settings".to_string())?;
+    std::fs::create_dir_all(directory)
+        .map_err(|e| format!("create CodeBuddy staging directory: {e}"))?;
+    let path = directory.join(format!("channel-{}.json", uuid::Uuid::new_v4()));
+    let mut options = std::fs::OpenOptions::new();
+    options.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        options.mode(0o600);
+    }
+    let mut file = options
+        .open(&path)
+        .map_err(|e| format!("create private CodeBuddy settings: {e}"))?;
+    built.cleanup_files.push(path.clone());
+    use std::io::Write;
+    file.write_all(&content)
+        .map_err(|e| format!("write private CodeBuddy settings: {e}"))?;
+    built.command.arg("--settings").arg(path);
     Ok(())
 }
 pub struct CodeBuddyEngine {
@@ -182,6 +247,19 @@ impl Engine for CodeBuddyEngine {
         if let Some(tools) = req.allowed_tools.as_deref() {
             cmd.arg("--permission-mode");
             cmd.arg("plan");
+            // --allowedTools only pre-approves without prompting; it is not a
+            // whitelist. The real tool-set restriction is --tools
+            // (comma-separated): anything not listed is unavailable to the
+            // model, including tools a future CLI version adds.
+            cmd.arg("--tools");
+            cmd.arg(
+                tools
+                    .iter()
+                    .map(|t| t.as_str())
+                    .chain(preapproved.iter().copied())
+                    .collect::<Vec<_>>()
+                    .join(","),
+            );
             cmd.arg("--allowedTools");
             for tool in tools {
                 cmd.arg(tool);
@@ -189,6 +267,9 @@ impl Engine for CodeBuddyEngine {
             for tool in &preapproved {
                 cmd.arg(*tool);
             }
+            // Defense in depth on top of --tools: deny the known write/exec/
+            // sub-agent tools explicitly so a read-only whitelist stays
+            // read-only even if the whitelist flag is ignored.
             cmd.arg("--disallowedTools");
             // CodeBuddy names differ from Claude's: PowerShell is the shell
             // tool on Windows and Agent/Workflow/TeamCreate spawn sub-agents.
@@ -216,8 +297,13 @@ impl Engine for CodeBuddyEngine {
                 }
                 mode => {
                     cmd.arg("--permission-mode");
+                    // "auto" maps to the CLI's own auto classifier (officially
+                    // supported under -p). The old acceptEdits fallback only
+                    // auto-approves file edits, so headless Bash/network calls
+                    // had no one to approve them and were denied outright.
                     cmd.arg(match mode {
                         "plan" => "plan",
+                        "auto" => "auto",
                         _ => "acceptEdits",
                     });
                     if mode == "auto" {
@@ -342,7 +428,7 @@ mod tests {
         assert!(debug.contains("--verbose"));
         assert!(debug.contains("--include-partial-messages"));
         assert!(debug.contains("--permission-mode"));
-        assert!(debug.contains("acceptEdits"));
+        assert!(debug.contains("auto"));
         assert!(debug.contains("--model"));
         assert!(debug.contains("hy4-preview"));
         assert!(debug.contains("--effort"));
@@ -388,6 +474,22 @@ mod tests {
         };
 
         let args = args_of(vec!["Read".to_string(), "Glob".to_string()]);
+        // --tools is the real whitelist: exactly the allowed tools, and
+        // nothing else (a comma-separated single argument).
+        let whitelist = &args[args
+            .iter()
+            .position(|a| a == "--tools")
+            .expect("--tools must be emitted")
+            + 1];
+        let listed: Vec<&str> = whitelist.split(',').collect();
+        assert_eq!(listed, ["Read", "Glob"]);
+        for tool in ["Bash", "Edit", "Write", "PowerShell"] {
+            assert!(
+                !listed.contains(&tool),
+                "whitelist must not contain {tool}"
+            );
+        }
+
         let denied = &args[args
             .iter()
             .position(|a| a == "--disallowedTools")
@@ -425,7 +527,7 @@ mod tests {
     }
 
     #[test]
-    fn channel_env_rides_settings_overlay_with_native_keys_masked() {
+    fn channel_env_rides_staged_settings_file_never_argv() {
         let mut built = BuiltCommand {
             command: tokio::process::Command::new("codebuddy"),
             stdin_payload: None,
@@ -445,22 +547,52 @@ mod tests {
                 "internal".to_string(),
             ),
         ]);
-        apply_channel(&mut built, &env).unwrap();
-        let args: Vec<_> = built.command.as_std().get_args().collect();
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-codebuddy-stage-{}",
+            uuid::Uuid::new_v4()
+        ));
+        apply_channel(&mut built, &env, &dir).unwrap();
+        let args: Vec<_> = built
+            .command
+            .as_std()
+            .get_args()
+            .map(|a| a.to_string_lossy().into_owned())
+            .collect();
         assert_eq!(args.len(), 2);
         assert_eq!(args[0], "--settings");
-        let settings: serde_json::Value =
-            serde_json::from_str(args[1].to_str().unwrap()).unwrap();
+        // The API key must never appear on argv: ps, /proc/<pid>/cmdline and
+        // diagnostic collectors would expose it for the child's lifetime.
+        assert!(
+            args.iter().all(|a| !a.contains("sk-test")),
+            "api key leaked onto argv: {args:?}"
+        );
+        assert_eq!(built.cleanup_files.len(), 1);
+        let staged_path = &built.cleanup_files[0];
+        assert_eq!(args[1], staged_path.to_string_lossy());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+            assert_eq!(
+                std::fs::metadata(staged_path).unwrap().permissions().mode() & 0o777,
+                0o600,
+                "staged settings must be private"
+            );
+        }
+        let staged: serde_json::Value =
+            serde_json::from_slice(&std::fs::read(staged_path).unwrap()).unwrap();
         assert_eq!(
-            settings["env"]["CODEBUDDY_BASE_URL"],
+            staged["env"]["CODEBUDDY_BASE_URL"],
             "https://copilot.tencent.com"
         );
-        assert_eq!(settings["env"]["CODEBUDDY_API_KEY"], "sk-test");
-        assert_eq!(settings["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"], "internal");
+        assert_eq!(staged["env"]["CODEBUDDY_API_KEY"], "sk-test");
+        assert_eq!(staged["env"]["CODEBUDDY_INTERNET_ENVIRONMENT"], "internal");
         // Convention keys the channel does not set are masked with empty
         // strings, so a stale native settings.json value cannot win over the
         // channel (--settings has the CLI's highest precedence).
-        assert_eq!(settings["env"]["CODEBUDDY_MODEL"], "");
+        assert_eq!(staged["env"]["CODEBUDDY_MODEL"], "");
+        super::super::cleanup_staged_files(&built.cleanup_files);
+        assert!(!staged_path.exists());
+        std::fs::remove_dir(dir).unwrap();
     }
 
     #[test]

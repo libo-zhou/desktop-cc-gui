@@ -101,10 +101,23 @@ pub(super) fn discover_claude(workspace: &Path) -> Vec<SessionFile> {
 }
 
 pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
+    // The CLI names project dirs with its own encoding (drops the leading
+    // separator, keeps spaces/underscores/case: /Users/a/CCGUI 项目/b →
+    // Users-a-CCGUI 项目-b), which differs from claude_encode_project_path
+    // and is not publicly specified. Scan every projects/* dir and attribute
+    // each transcript by the cwd/sessionId recorded on its lines instead of
+    // reverse-engineering the directory name.
     let base = crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("projects");
     let mut out = Vec::new();
     let mut seen_sessions = std::collections::HashSet::new();
-    for dir in claude_project_dirs(&base, workspace) {
+    let Ok(projects) = std::fs::read_dir(&base) else {
+        return out;
+    };
+    for project in projects.flatten() {
+        let dir = project.path();
+        if !dir.is_dir() {
+            continue;
+        }
         let Ok(entries) = std::fs::read_dir(&dir) else {
             continue;
         };
@@ -113,21 +126,55 @@ pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
             if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
                 continue;
             }
-            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+            let Some((session_id, cwd)) = codebuddy_head(&path) else {
                 continue;
             };
-            if stem == "history" || !seen_sessions.insert(stem.to_string()) {
+            if !same_or_child(Path::new(&cwd), workspace)
+                || !seen_sessions.insert(session_id.clone())
+            {
                 continue;
             }
             out.push(SessionFile {
                 engine: "codebuddy",
-                session_id: stem.to_string(),
+                session_id,
                 workspace_path: workspace.to_string_lossy().to_string(),
                 file_path: path,
             });
         }
     }
     out
+}
+
+/// Session identity from a CodeBuddy transcript's head lines: every
+/// conversation line carries `sessionId` and `cwd` (e.g.
+/// `{"type":"message","role":"user",...,"sessionId":...,"cwd":...}`).
+/// Non-conversation head lines (file-history-snapshot, ai-title) are skipped
+/// while scanning. Falls back to the file stem when the line carries cwd
+/// but no sessionId.
+fn codebuddy_head(path: &Path) -> Option<(String, String)> {
+    for head in peek_head_json_lines(path, false, 8) {
+        let Some(cwd) = head
+            .get("cwd")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+        else {
+            continue;
+        };
+        let id = head
+            .get("sessionId")
+            .and_then(|v| v.as_str())
+            .map(str::trim)
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .or_else(|| {
+                path.file_stem()
+                    .and_then(|s| s.to_str())
+                    .map(str::to_string)
+            })?;
+        return Some((id, cwd.to_string()));
+    }
+    None
 }
 
 /// Strip the `\\?\` verbatim prefix Windows `canonicalize` adds — the CLI
@@ -1082,6 +1129,29 @@ mod tests {
         }
     }
 
+    /// Env-mutating guard for CODEBUDDY_CONFIG_DIR; shares HOME_LOCK so every
+    /// env-dependent scanner test stays serialized.
+    struct CodebuddyConfigDirGuard {
+        _lock: parking_lot::MutexGuard<'static, ()>,
+        prev: Option<std::ffi::OsString>,
+    }
+    impl CodebuddyConfigDirGuard {
+        fn set(dir: &Path) -> Self {
+            let lock = HOME_LOCK.lock();
+            let prev = std::env::var_os("CODEBUDDY_CONFIG_DIR");
+            std::env::set_var("CODEBUDDY_CONFIG_DIR", dir);
+            Self { _lock: lock, prev }
+        }
+    }
+    impl Drop for CodebuddyConfigDirGuard {
+        fn drop(&mut self) {
+            match &self.prev {
+                Some(value) => std::env::set_var("CODEBUDDY_CONFIG_DIR", value),
+                None => std::env::remove_var("CODEBUDDY_CONFIG_DIR"),
+            }
+        }
+    }
+
     #[test]
     fn identify_head_reads_session_line_after_title_line() {
         let dir = scratch_dir("identify");
@@ -1232,6 +1302,70 @@ mod tests {
         let found = discover_claude(&spelled);
         assert_eq!(found.len(), 1);
         assert_eq!(found[0].session_id, "s1");
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn discover_codebuddy_attributes_by_transcript_cwd_not_dir_name() {
+        let home = scratch_dir("discover-codebuddy");
+        let config_dir = home.join("codebuddy-config");
+        let workspace = home.join("ws").join("CCGUI 项目");
+        std::fs::create_dir_all(&workspace).unwrap();
+        // Real CLI v2.175.0 dir naming: leading separator dropped,
+        // spaces/underscores/case kept — nothing like the Claude slug the
+        // old code derived. A name the app cannot recompute on purpose.
+        let project_dir = config_dir
+            .join("projects")
+            .join("Users-someone-CCGUI 项目-ws_backup");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let cwd = workspace.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            project_dir.join("sess-1.jsonl"),
+            format!(
+                "{{\"type\":\"file-history-snapshot\",\"messageId\":\"m0\",\"snapshot\":{{}}}}\n{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hi\"}}],\"sessionId\":\"sess-1\",\"cwd\":\"{cwd}\"}}\n",
+            ),
+        )
+        .unwrap();
+        // A sibling project dir whose sessions belong to another workspace.
+        let other_dir = config_dir.join("projects").join("elsewhere");
+        std::fs::create_dir_all(&other_dir).unwrap();
+        std::fs::write(
+            other_dir.join("sess-2.jsonl"),
+            "{\"type\":\"message\",\"role\":\"user\",\"content\":[{\"type\":\"input_text\",\"text\":\"x\"}],\"sessionId\":\"sess-2\",\"cwd\":\"/somewhere/else\"}\n",
+        )
+        .unwrap();
+
+        let _guard = CodebuddyConfigDirGuard::set(&config_dir);
+        let found = discover_codebuddy(&workspace);
+        assert_eq!(found.len(), 1, "expected only the workspace session");
+        assert_eq!(found[0].session_id, "sess-1");
+        assert!(found[0].file_path.ends_with("sess-1.jsonl"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn discover_codebuddy_falls_back_to_file_stem_without_session_id() {
+        let home = scratch_dir("discover-codebuddy-stem");
+        let config_dir = home.join("codebuddy-config");
+        let workspace = home.join("ws");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let project_dir = config_dir.join("projects").join("any-name");
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let cwd = workspace.to_string_lossy().replace('\\', "\\\\");
+        std::fs::write(
+            project_dir.join("stem-id.jsonl"),
+            format!(
+                "{{\"type\":\"message\",\"role\":\"user\",\"content\":[{{\"type\":\"input_text\",\"text\":\"hi\"}}],\"cwd\":\"{cwd}\"}}\n"
+            ),
+        )
+        .unwrap();
+
+        let _guard = CodebuddyConfigDirGuard::set(&config_dir);
+        let found = discover_codebuddy(&workspace);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "stem-id");
 
         std::fs::remove_dir_all(&home).ok();
     }
