@@ -1090,6 +1090,8 @@ export const ko: Messages = {
     "codebuddyAccountRefresh": "상태 새로고침",
     "codebuddyAccountChecking": "확인 중…",
     "codebuddyAccountCheckingDesc": "시스템 자격 증명 저장소를 읽는 중",
+    "codebuddyAccountError": "상태 확인 실패",
+    "codebuddyAccountErrorDesc": "로그인 상태를 읽지 못했습니다. 상태 새로고침을 시도하세요",
     "codebuddyAccountLoggedIn": "로그인됨",
     "codebuddyAccountUnknown": "상태 확인 불가",
     "codebuddyAccountUnknownDesc": "시스템 자격 증명 저장소에서 로그인 상태를 확인하지 못했습니다. 터미널에서 이미 /login 했다면 그대로 사용할 수 있습니다",

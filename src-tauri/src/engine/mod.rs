@@ -1935,6 +1935,100 @@ mod prompt_contribution_tests {
 }
 
 #[cfg(test)]
+mod codebuddy_launch_tests {
+    use super::*;
+
+    struct ScratchHome {
+        dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_profile: Option<std::ffi::OsString>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new() -> Self {
+            let lock = crate::paths::HOME_ENV_LOCK.lock();
+            let dir = std::env::temp_dir().join(format!(
+                "ccgui-codebuddy-launch-test-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("USERPROFILE", &dir);
+            Self {
+                dir,
+                previous_home,
+                previous_profile,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_profile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn channel_model_reaches_overlay_when_request_has_no_model() {
+        let home = ScratchHome::new();
+        let mut config = crate::config::CliConfig::default();
+        let section = config.section_mut("codebuddy").unwrap();
+        section.providers.insert(
+            "channel".into(),
+            serde_json::json!({"model":"channel-model"}),
+        );
+        section.current = Some("channel".into());
+        crate::paths::ensure_dirs().unwrap();
+        crate::settings::atomic_write(
+            &crate::paths::config_path(),
+            &serde_json::to_string(&config).unwrap(),
+        )
+        .unwrap();
+
+        let launch = prepare_launch(
+            "codebuddy",
+            home.dir.join("workspace").to_str().unwrap(),
+            None,
+            "hello".into(),
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            None,
+            Vec::new(),
+            None,
+            None,
+            None,
+            None,
+            false,
+        )
+        .unwrap();
+        assert_eq!(launch.req.model, None);
+        assert_eq!(launch.built.cleanup_files.len(), 1);
+        let overlay: Value = serde_json::from_slice(
+            &std::fs::read(&launch.built.cleanup_files[0]).unwrap(),
+        )
+        .unwrap();
+        assert_eq!(overlay["model"], "channel-model");
+        assert_eq!(overlay["env"]["CODEBUDDY_MODEL"], "channel-model");
+        cleanup_staged_files(&launch.built.cleanup_files);
+    }
+}
+
+#[cfg(test)]
 mod permission_tests {
     use super::*;
 

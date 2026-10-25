@@ -13,7 +13,13 @@
 import { ipc } from "@/lib/ipc";
 import { useChatStore } from "@/features/chat/store";
 import { useTerminalStore } from "@/features/terminal/store";
-import { ENTER, shellQuote, waitForSession } from "./terminalLogin";
+import {
+  ENTER,
+  openDedicatedTerminalTab,
+  runCliLogin,
+  shellQuote,
+  waitForSession,
+} from "./terminalLogin";
 
 /**
  * Open the terminal dock on a fresh tab and start the OAuth login flow.
@@ -26,26 +32,36 @@ export async function launchPiFamilyLogin(
   const workspacePath = useChatStore.getState().active?.workspacePath;
   if (!workspacePath) return false;
 
-  const term = useTerminalStore.getState();
-  if (!term.open) term.toggle(workspacePath); // opens; creates a tab if none
-  useTerminalStore.getState().newTab(workspacePath); // dedicated login tab
-  const id = useTerminalStore.getState().activeByWorkspace[workspacePath];
+  const id = openDedicatedTerminalTab(workspacePath);
   if (!id) return false;
+  const failed = () => {
+    useTerminalStore.getState().closeTab(workspacePath, id);
+    return false;
+  };
 
-  const settings = await ipc.getAppSettings().catch(() => null);
-  const customBin = (engine === "pi" ? settings?.piBin : settings?.ompBin)?.trim();
-  const bin = shellQuote(customBin || engine);
+  let bin: string;
+  try {
+    const [settings, host] = await Promise.all([
+      ipc.getAppSettings().catch(() => null),
+      ipc.terminalHostInfo(),
+    ]);
+    const customBin = (engine === "pi" ? settings?.piBin : settings?.ompBin)?.trim();
+    bin = shellQuote(customBin || engine, host);
+  } catch {
+    return failed();
+  }
 
-  if (!(await waitForSession(id))) return false;
+  if (!(await waitForSession(id))) return failed();
 
   if (engine === "omp") {
-    void ipc.terminalWrite(id, `${bin} auth-broker login ${loginArg}${ENTER}`).catch(() => {});
-    return true;
+    try {
+      await ipc.terminalWrite(id, `${bin} auth-broker login ${loginArg}${ENTER}`);
+      return true;
+    } catch {
+      return failed();
+    }
   }
-  void ipc.terminalWrite(id, `${bin}${ENTER}`).catch(() => {});
-  window.setTimeout(() => {
-    void ipc.terminalWrite(id, `/login ${loginArg}${ENTER}`).catch(() => {});
-  }, 1500);
+  if (!(await runCliLogin(id, bin, `/login ${loginArg}`))) return failed();
   return true;
 }
 
@@ -57,23 +73,39 @@ export async function launchPiFamilyLogout(
   const workspacePath = useChatStore.getState().active?.workspacePath;
   if (!workspacePath) return false;
 
-  const term = useTerminalStore.getState();
-  if (!term.open) term.toggle(workspacePath);
-  useTerminalStore.getState().newTab(workspacePath);
-  const id = useTerminalStore.getState().activeByWorkspace[workspacePath];
+  const id = openDedicatedTerminalTab(workspacePath);
   if (!id) return false;
+  const failed = () => {
+    useTerminalStore.getState().closeTab(workspacePath, id);
+    return false;
+  };
 
-  const settings = await ipc.getAppSettings().catch(() => null);
-  const customBin = (engine === "pi" ? settings?.piBin : settings?.ompBin)?.trim();
-  const bin = shellQuote(customBin || engine);
-  if (!(await waitForSession(id))) return false;
+  let bin: string;
+  try {
+    const [settings, host] = await Promise.all([
+      ipc.getAppSettings().catch(() => null),
+      ipc.terminalHostInfo(),
+    ]);
+    const customBin = (engine === "pi" ? settings?.piBin : settings?.ompBin)?.trim();
+    bin = shellQuote(customBin || engine, host);
+    if (!(await waitForSession(id))) return failed();
 
-  if (engine === "omp") {
-    await ipc.terminalWrite(id, `${bin} auth-broker logout ${providerId}${ENTER}`);
-    return true;
+    if (engine === "omp") {
+      await ipc.terminalWrite(id, `${bin} auth-broker logout ${providerId}${ENTER}`);
+      return true;
+    }
+    await ipc.terminalWrite(id, `${bin}${ENTER}`);
+  } catch (error) {
+    failed();
+    throw error;
   }
-  await ipc.terminalWrite(id, `${bin}${ENTER}`);
   window.setTimeout(() => {
+    const tabStillExists = useTerminalStore
+      .getState()
+      .tabsByWorkspace[workspacePath]?.some((tab) => tab.id === id);
+    if (!tabStillExists) {
+      return;
+    }
     void ipc.terminalWrite(id, `/logout${ENTER}`).catch(() => {});
   }, 1500);
   return true;

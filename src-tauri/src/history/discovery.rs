@@ -20,17 +20,22 @@ fn peek_head_json_lines(
     zstd_compressed: bool,
     max_lines: usize,
 ) -> Vec<serde_json::Value> {
+    try_peek_head_json_lines(path, zstd_compressed, max_lines).unwrap_or_default()
+}
+
+/// Fallible variant for callers that must not confuse an unreadable file with
+/// a successfully inspected file carrying no usable identity.
+fn try_peek_head_json_lines(
+    path: &Path,
+    zstd_compressed: bool,
+    max_lines: usize,
+) -> std::io::Result<Vec<serde_json::Value>> {
     use std::io::{BufReader, Read};
     const CHUNK_BYTES: usize = 16 * 1024;
     const MAX_HEAD_BYTES: usize = 1024 * 1024;
-    let Ok(file) = std::fs::File::open(path) else {
-        return Vec::new();
-    };
+    let file = std::fs::File::open(path)?;
     let mut reader: Box<dyn Read> = if zstd_compressed {
-        match zstd::stream::read::Decoder::new(BufReader::new(file)) {
-            Ok(decoder) => Box::new(decoder),
-            Err(_) => return Vec::new(),
-        }
+        Box::new(zstd::stream::read::Decoder::new(BufReader::new(file))?)
     } else {
         Box::new(file)
     };
@@ -50,7 +55,7 @@ fn peek_head_json_lines(
                 newline_count += chunk[..n].iter().filter(|&&b| b == b'\n').count();
                 buf.extend_from_slice(&chunk[..n]);
             }
-            Err(_) => return Vec::new(),
+            Err(error) => return Err(error),
         }
     }
     let head = String::from_utf8_lossy(&buf);
@@ -61,11 +66,11 @@ fn peek_head_json_lines(
         // is a complete final line.
         lines.pop();
     }
-    lines
+    Ok(lines
         .into_iter()
         .take(max_lines)
         .filter_map(|line| serde_json::from_str(line.trim()).ok())
-        .collect()
+        .collect())
 }
 
 pub(super) fn discover_claude(workspace: &Path) -> Vec<SessionFile> {
@@ -106,7 +111,52 @@ pub(super) struct CodebuddyTranscript {
     pub session_id: String,
     pub cwd: String,
     pub path: PathBuf,
+    canonical_cwd: Option<PathBuf>,
     modified: std::time::SystemTime,
+}
+
+#[derive(Clone)]
+struct CodebuddyIdentity {
+    session_id: String,
+    cwd: String,
+}
+
+struct CachedCodebuddyHead {
+    signature: (i64, i64),
+    identity: Option<CodebuddyIdentity>,
+}
+
+// Keep identity peeks out of no-op scans. Clearing at the bound is cheaper
+// than LRU bookkeeping and mirrors the other small, rebuildable disk caches.
+const CODEBUDDY_HEAD_CACHE_CAPACITY: usize = 4096;
+static CODEBUDDY_HEAD_CACHE: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashMap<PathBuf, CachedCodebuddyHead>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashMap::new()));
+
+#[cfg(test)]
+static CODEBUDDY_HEAD_READS: std::sync::atomic::AtomicUsize =
+    std::sync::atomic::AtomicUsize::new(0);
+
+#[cfg(test)]
+pub(super) fn reset_codebuddy_head_read_count() {
+    CODEBUDDY_HEAD_READS.store(0, std::sync::atomic::Ordering::Relaxed);
+}
+
+#[cfg(test)]
+pub(super) fn codebuddy_head_read_count() -> usize {
+    CODEBUDDY_HEAD_READS.load(std::sync::atomic::Ordering::Relaxed)
+}
+
+#[cfg(test)]
+static CODEBUDDY_HEAD_TEST_IO_ERRORS: std::sync::LazyLock<
+    parking_lot::Mutex<std::collections::HashSet<PathBuf>>,
+> = std::sync::LazyLock::new(|| parking_lot::Mutex::new(std::collections::HashSet::new()));
+
+#[cfg(test)]
+pub(super) fn inject_codebuddy_head_io_error(path: &Path) {
+    CODEBUDDY_HEAD_TEST_IO_ERRORS
+        .lock()
+        .insert(path.to_path_buf());
 }
 
 /// Enumerate every CodeBuddy transcript once per scan.
@@ -115,10 +165,11 @@ pub(super) struct CodebuddyTranscript {
 /// separator, keeps spaces/underscores/case: /Users/a/CCGUI 项目/b →
 /// Users-a-CCGUI 项目-b), which differs from claude_encode_project_path and is
 /// not publicly specified. Attribution therefore uses the cwd recorded on each
-/// transcript, which requires reading its head — do that once per scan rather
-/// than once per workspace (the scan used to pay O(workspaces × transcripts)
-/// head reads). Deduping by session id here, newest transcript wins, makes the
-/// retained file deterministic: read_dir order is unspecified, and a session
+/// transcript. A bounded (path, size, mtime) cache keeps unchanged heads out
+/// of no-op scans; a changed or new file is identified once, not once per
+/// workspace (the scan used to pay O(workspaces × transcripts) head reads).
+/// Deduping by session id here, newest transcript wins, makes the retained
+/// file deterministic: read_dir order is unspecified, and a session
 /// can appear under several project dirs after a resume or workspace move.
 pub(super) fn codebuddy_transcripts() -> Vec<CodebuddyTranscript> {
     let mut by_session: std::collections::HashMap<String, CodebuddyTranscript> =
@@ -143,8 +194,9 @@ pub(super) fn codebuddy_transcripts() -> Vec<CodebuddyTranscript> {
     found
 }
 
-/// Every transcript on disk (no dedupe). Deletion needs the duplicates too.
-fn codebuddy_raw_transcripts() -> Vec<CodebuddyTranscript> {
+/// Every transcript path on disk, without reading content. Scanning and
+/// deletion share this enumeration so a damaged duplicate remains deletable.
+fn codebuddy_transcript_paths() -> Vec<PathBuf> {
     let base =
         crate::engine::engine_home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("projects");
     let mut found = Vec::new();
@@ -161,23 +213,39 @@ fn codebuddy_raw_transcripts() -> Vec<CodebuddyTranscript> {
         };
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.extension().and_then(|e| e.to_str()) != Some("jsonl") {
-                continue;
+            if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+                found.push(path);
             }
-            let Some((session_id, cwd)) = codebuddy_head(&path) else {
-                continue;
-            };
-            let modified = entry
-                .metadata()
-                .and_then(|metadata| metadata.modified())
-                .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
-            found.push(CodebuddyTranscript {
-                session_id,
-                cwd,
-                path,
-                modified,
-            });
         }
+    }
+    found
+}
+
+/// Every parseable transcript on disk (no dedupe). Newest-wins selection must
+/// compare all copies before choosing the retained one.
+fn codebuddy_raw_transcripts() -> Vec<CodebuddyTranscript> {
+    let mut found = Vec::new();
+    for path in codebuddy_transcript_paths() {
+        let metadata = std::fs::metadata(&path).ok();
+        let signature = metadata
+            .as_ref()
+            .and_then(|metadata| codebuddy_metadata_signature(metadata));
+        let Ok(Some(identity)) = codebuddy_head_with_signature(&path, signature) else {
+            continue;
+        };
+        let modified = metadata
+            .and_then(|metadata| metadata.modified().ok())
+            .unwrap_or(std::time::SystemTime::UNIX_EPOCH);
+        // Resolve once per transcript per scan, not once per workspace. Keep
+        // this outside the content cache so retargeting a symlink is observed.
+        let canonical_cwd = std::fs::canonicalize(&identity.cwd).ok();
+        found.push(CodebuddyTranscript {
+            session_id: identity.session_id,
+            cwd: identity.cwd,
+            canonical_cwd,
+            path,
+            modified,
+        });
     }
     found
 }
@@ -186,9 +254,20 @@ pub(super) fn discover_codebuddy_in(
     transcripts: &[CodebuddyTranscript],
     workspace: &Path,
 ) -> Vec<SessionFile> {
+    // Canonicalize each workspace once per scan. Transcript cwd resolution was
+    // done once during enumeration, avoiding a canonicalize per workspace×transcript.
+    let canonical_workspace = std::fs::canonicalize(workspace).ok();
     transcripts
         .iter()
-        .filter(|transcript| same_or_child(Path::new(&transcript.cwd), workspace))
+        .filter(|transcript| {
+            same_or_child(Path::new(&transcript.cwd), workspace)
+                || canonical_workspace.as_ref().is_some_and(|workspace| {
+                    transcript
+                        .canonical_cwd
+                        .as_ref()
+                        .is_some_and(|cwd| same_or_child(cwd, workspace))
+                })
+        })
         .map(|transcript| SessionFile {
             engine: "codebuddy",
             session_id: transcript.session_id.clone(),
@@ -198,25 +277,78 @@ pub(super) fn discover_codebuddy_in(
         .collect()
 }
 
+#[cfg(test)]
 pub(super) fn discover_codebuddy(workspace: &Path) -> Vec<SessionFile> {
     discover_codebuddy_in(&codebuddy_transcripts(), workspace)
 }
 
-/// Session id recorded in a transcript's head; `None` when the file carries
-/// no cwd/sessionId at all.
-pub(super) fn codebuddy_session_id(path: &Path) -> Option<String> {
-    codebuddy_head(path).map(|(session_id, _)| session_id)
+/// Session id recorded in a transcript's head. `Ok(None)` means the file was
+/// read successfully but carried no identity; `Err` means that is still unknown.
+pub(super) fn codebuddy_session_id(path: &Path) -> std::io::Result<Option<String>> {
+    Ok(codebuddy_head(path)?.map(|identity| identity.session_id))
 }
 
-/// Every on-disk transcript carrying `session_id`. Deleting a session must
-/// clear all copies: the scan keeps the newest one, so a sibling left behind
-/// would resurrect the session on the next scan.
+/// Every on-disk transcript carrying `session_id`. A successfully read copy
+/// with a damaged/identity-free head falls back to its file stem. An I/O error
+/// skips that copy: its stem is not evidence of the session it belongs to.
 pub(super) fn codebuddy_session_paths(session_id: &str) -> Vec<PathBuf> {
-    codebuddy_raw_transcripts()
+    codebuddy_transcript_paths()
         .into_iter()
-        .filter(|transcript| transcript.session_id == session_id)
-        .map(|transcript| transcript.path)
+        .filter(|path| match codebuddy_session_id(path) {
+            Ok(Some(id)) => id == session_id,
+            Ok(None) => path.file_stem().and_then(|stem| stem.to_str()) == Some(session_id),
+            Err(_) => false,
+        })
         .collect()
+}
+
+fn codebuddy_metadata_signature(metadata: &std::fs::Metadata) -> Option<(i64, i64)> {
+    let mtime_ms = metadata
+        .modified()
+        .ok()?
+        .duration_since(std::time::UNIX_EPOCH)
+        .ok()?
+        .as_millis() as i64;
+    Some((metadata.len() as i64, mtime_ms))
+}
+
+fn codebuddy_head(path: &Path) -> std::io::Result<Option<CodebuddyIdentity>> {
+    let signature = std::fs::metadata(path)
+        .ok()
+        .and_then(|metadata| codebuddy_metadata_signature(&metadata));
+    codebuddy_head_with_signature(path, signature)
+}
+
+fn codebuddy_head_with_signature(
+    path: &Path,
+    signature: Option<(i64, i64)>,
+) -> std::io::Result<Option<CodebuddyIdentity>> {
+    if let Some(signature) = signature {
+        let cached = CODEBUDDY_HEAD_CACHE.lock().get(path).and_then(|cached| {
+            (cached.signature == signature).then(|| cached.identity.clone())
+        });
+        if let Some(identity) = cached {
+            return Ok(identity);
+        }
+    }
+
+    // Only successful reads enter the cache, including confirmed malformed or
+    // identity-free files. A transient error must be retried on the next scan.
+    let identity = read_codebuddy_head(path)?;
+    if let Some(signature) = signature {
+        let mut cache = CODEBUDDY_HEAD_CACHE.lock();
+        if cache.len() >= CODEBUDDY_HEAD_CACHE_CAPACITY && !cache.contains_key(path) {
+            cache.clear();
+        }
+        cache.insert(
+            path.to_path_buf(),
+            CachedCodebuddyHead {
+                signature,
+                identity: identity.clone(),
+            },
+        );
+    }
+    Ok(identity)
 }
 
 /// Session identity from a CodeBuddy transcript's head lines: every
@@ -228,8 +360,19 @@ pub(super) fn codebuddy_session_paths(session_id: &str) -> Vec<PathBuf> {
 /// conversation lines, and `peek_head_json_lines` already caps total bytes,
 /// so a generous line budget costs nothing and avoids dropping sessions whose
 /// head carries many snapshots.
-fn codebuddy_head(path: &Path) -> Option<(String, String)> {
-    for head in peek_head_json_lines(path, false, 64) {
+fn read_codebuddy_head(path: &Path) -> std::io::Result<Option<CodebuddyIdentity>> {
+    #[cfg(test)]
+    if CODEBUDDY_HEAD_TEST_IO_ERRORS.lock().remove(path) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::PermissionDenied,
+            "injected CodeBuddy head read failure",
+        ));
+    }
+
+    #[cfg(test)]
+    CODEBUDDY_HEAD_READS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+
+    for head in try_peek_head_json_lines(path, false, 64)? {
         let Some(cwd) = head
             .get("cwd")
             .and_then(|v| v.as_str())
@@ -238,7 +381,7 @@ fn codebuddy_head(path: &Path) -> Option<(String, String)> {
         else {
             continue;
         };
-        let id = head
+        let Some(id) = head
             .get("sessionId")
             .and_then(|v| v.as_str())
             .map(str::trim)
@@ -248,10 +391,16 @@ fn codebuddy_head(path: &Path) -> Option<(String, String)> {
                 path.file_stem()
                     .and_then(|s| s.to_str())
                     .map(str::to_string)
-            })?;
-        return Some((id, cwd.to_string()));
+            })
+        else {
+            return Ok(None);
+        };
+        return Ok(Some(CodebuddyIdentity {
+            session_id: id,
+            cwd: cwd.to_string(),
+        }));
     }
-    None
+    Ok(None)
 }
 
 /// Strip the `\\?\` verbatim prefix Windows `canonicalize` adds — the CLI
@@ -1418,6 +1567,83 @@ mod tests {
         assert_eq!(found.len(), 1, "expected only the workspace session");
         assert_eq!(found[0].session_id, "sess-1");
         assert!(found[0].file_path.ends_with("sess-1.jsonl"));
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[test]
+    fn discover_codebuddy_retries_io_error_with_unchanged_stat() {
+        let home = scratch_dir("discover-codebuddy-io-retry");
+        let config_dir = home.join("codebuddy-config");
+        let workspace = home.join("ws");
+        let project_dir = config_dir.join("projects").join("project");
+        std::fs::create_dir_all(&workspace).unwrap();
+        std::fs::create_dir_all(&project_dir).unwrap();
+        let path = project_dir.join("recovered.jsonl");
+        let line = serde_json::json!({
+            "type": "message",
+            "role": "user",
+            "content": [],
+            "sessionId": "recovered",
+            "cwd": workspace.to_string_lossy(),
+        });
+        std::fs::write(&path, format!("{line}\n")).unwrap();
+        let original_stat = crate::history::stat_signature(&path);
+
+        let _guard = CodebuddyConfigDirGuard::set(&config_dir);
+        inject_codebuddy_head_io_error(&path);
+        assert!(discover_codebuddy(&workspace).is_empty());
+        assert_eq!(crate::history::stat_signature(&path), original_stat);
+
+        // No size/mtime change: only a transient error not entering the cache
+        // allows the second discovery to see this session.
+        let found = discover_codebuddy(&workspace);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "recovered");
+        assert_eq!(crate::history::stat_signature(&path), original_stat);
+
+        std::fs::remove_dir_all(&home).ok();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn discover_codebuddy_matches_symlink_and_raw_workspace_paths() {
+        let home = scratch_dir("discover-codebuddy-symlink");
+        let config_dir = home.join("codebuddy-config");
+        let workspace = home.join("ws");
+        let nested = workspace.join("nested");
+        let alias = home.join("ws-alias");
+        std::fs::create_dir_all(&nested).unwrap();
+        std::os::unix::fs::symlink(&workspace, &alias).unwrap();
+        let write_transcript = |project: &str, name: &str, id: &str, cwd: &Path| {
+            let project_dir = config_dir.join("projects").join(project);
+            std::fs::create_dir_all(&project_dir).unwrap();
+            let line = serde_json::json!({
+                "type": "message",
+                "role": "user",
+                "content": [],
+                "sessionId": id,
+                "cwd": cwd.to_string_lossy(),
+            });
+            std::fs::write(project_dir.join(name), format!("{line}\n")).unwrap();
+        };
+        let linked_cwd = alias.join("nested");
+        write_transcript("linked", "linked.jsonl", "linked", &linked_cwd);
+
+        let _guard = CodebuddyConfigDirGuard::set(&config_dir);
+        // The recorded cwd uses the alias while the registered workspace is
+        // its real path. Raw starts_with alone cannot attribute this session.
+        let found = discover_codebuddy(&workspace);
+        assert_eq!(found.len(), 1);
+        assert_eq!(found[0].session_id, "linked");
+
+        // The reverse spelling must work too: a raw transcript cwd belongs to
+        // a workspace registered through its symlink.
+        write_transcript("raw", "raw.jsonl", "raw", &nested);
+        let found = discover_codebuddy(&alias);
+        let mut ids: Vec<&str> = found.iter().map(|file| file.session_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, ["linked", "raw"]);
 
         std::fs::remove_dir_all(&home).ok();
     }

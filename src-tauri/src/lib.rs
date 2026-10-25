@@ -574,6 +574,7 @@ pub fn run() {
             open_app::get_program_icon,
             open_app::reveal_in_file_manager,
             // terminal
+            terminal::terminal_host_info,
             terminal::terminal_open,
             terminal::terminal_write,
             terminal::terminal_resize,

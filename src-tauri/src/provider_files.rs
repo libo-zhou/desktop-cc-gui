@@ -85,6 +85,10 @@ fn targets(engine: &str) -> Vec<Target> {
             home(Some("GROK_HOME"), ".grok").join("config.toml"),
             "config.toml",
         )],
+        "codebuddy" => vec![target(
+            home(Some("CODEBUDDY_CONFIG_DIR"), ".codebuddy").join("settings.json"),
+            "settings.json",
+        )],
         "agy" => vec![target(
             crate::engine::agy::agy_home().join("settings.json"),
             "settings.json",
@@ -628,7 +632,13 @@ pub(crate) fn channel_env(
 /// them to the wrong auth/endpoint family — the very 401 this derivation is
 /// meant to prevent.
 fn codebuddy_edition_for(base_url: &str) -> Option<&'static str> {
-    let (_, rest) = base_url.split_once("://")?;
+    let rest = base_url.split_once("://").map_or(base_url, |(scheme, rest)| {
+        if scheme.is_empty() || scheme.contains(['/', '?', '#']) {
+            base_url
+        } else {
+            rest
+        }
+    });
     let authority = rest.split(['/', '?', '#']).next().unwrap_or(rest);
     let host_port = authority.rsplit('@').next().unwrap_or(authority);
     let host = host_port
@@ -1265,7 +1275,9 @@ mod tests {
         // pinned both to "internal".
         for base in [
             "https://copilot.tencent.com.example.org/v1",
+            "copilot.tencent.com.example.org/v1",
             "https://gateway.corp/https://copilot.tencent.com/v1",
+            "gateway.corp/https://copilot.tencent.com/v1",
         ] {
             let lookalike = serde_json::json!({ "baseUrl": base, "apiKey": "sk-z" });
             let env = channel_env("codebuddy", &lookalike).unwrap();
@@ -1281,6 +1293,18 @@ mod tests {
             "apiKey": "sk-p",
         });
         let env = channel_env("codebuddy", &port).unwrap();
+        assert_eq!(
+            env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
+            Some("internal")
+        );
+
+        // Channels may omit the URL scheme; host/path is still an exact-host
+        // match rather than a substring or proxy-path match.
+        let bare = serde_json::json!({
+            "baseUrl": "copilot.tencent.com/v1",
+            "apiKey": "sk-bare",
+        });
+        let env = channel_env("codebuddy", &bare).unwrap();
         assert_eq!(
             env.get("CODEBUDDY_INTERNET_ENVIRONMENT").map(String::as_str),
             Some("internal")
@@ -1324,6 +1348,89 @@ mod tests {
         assert!(!target.backup.exists());
         assert_eq!(std::fs::read_to_string(&target.path).unwrap(), r#"{"b":1}"#);
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    struct ScratchHome {
+        dir: PathBuf,
+        saved: Vec<(&'static str, Option<std::ffi::OsString>)>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new() -> Self {
+            let lock = crate::paths::HOME_ENV_LOCK.lock();
+            let dir = std::env::temp_dir().join(format!(
+                "ccgui-codebuddy-official-config-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let config_home = dir.join("codebuddy-home");
+            let mut saved = Vec::new();
+            for (key, value) in [
+                ("HOME", &dir),
+                ("USERPROFILE", &dir),
+                ("CODEBUDDY_CONFIG_DIR", &config_home),
+            ] {
+                saved.push((key, std::env::var_os(key)));
+                std::env::set_var(key, value);
+            }
+            Self {
+                dir,
+                saved,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            for (key, value) in self.saved.drain(..) {
+                match value {
+                    Some(value) => std::env::set_var(key, value),
+                    None => std::env::remove_var(key),
+                }
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn codebuddy_native_settings_are_editable_at_the_configured_home() {
+        use tauri::Manager;
+        let home = ScratchHome::new();
+        let path = home.dir.join("codebuddy-home/settings.json");
+        assert_eq!(
+            provider_file_paths("codebuddy".into()),
+            vec![path.to_string_lossy().into_owned()]
+        );
+
+        let missing = official_config_read("codebuddy".into()).unwrap();
+        assert_eq!(missing.len(), 1);
+        assert_eq!(missing[0].path, path.to_string_lossy());
+        assert_eq!(missing[0].format, "json");
+        assert!(!missing[0].exists);
+        assert_eq!(missing[0].content, "");
+
+        let app = tauri::test::mock_builder()
+            .manage(crate::config::ConfigStore::default())
+            .build(tauri::test::mock_context(tauri::test::noop_assets()))
+            .unwrap();
+        let content = r#"{"model":"native-model","env":{"CUSTOM":"kept"}}"#;
+        official_config_write(
+            app.state(),
+            "codebuddy".into(),
+            vec![OfficialConfigDraft {
+                path: path.to_string_lossy().into_owned(),
+                content: content.into(),
+            }],
+        )
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), content);
+
+        let read = official_config_read("codebuddy".into()).unwrap();
+        assert_eq!(read.len(), 1);
+        assert!(read[0].exists);
+        assert_eq!(read[0].content, content);
     }
 
     static SEQ: AtomicU32 = AtomicU32::new(0);

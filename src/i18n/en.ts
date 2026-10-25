@@ -1174,6 +1174,8 @@ export const en: Messages = {
     codebuddyAccountRefresh: "Refresh Status",
     codebuddyAccountChecking: "Checking…",
     codebuddyAccountCheckingDesc: "Reading the OS credential store",
+    codebuddyAccountError: "Status Check Failed",
+    codebuddyAccountErrorDesc: "Could not read the login status; try Refresh Status",
     codebuddyAccountLoggedIn: "Logged In",
     codebuddyAccountUnknown: "Status Unknown",
     codebuddyAccountUnknownDesc:

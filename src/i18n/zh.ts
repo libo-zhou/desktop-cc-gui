@@ -1128,6 +1128,8 @@ export const zh = {
     codebuddyAccountRefresh: "刷新状态",
     codebuddyAccountChecking: "检测中…",
     codebuddyAccountCheckingDesc: "正在读取系统凭据存储",
+    codebuddyAccountError: "状态检测失败",
+    codebuddyAccountErrorDesc: "无法读取登录状态，请尝试刷新状态",
     codebuddyAccountLoggedIn: "已登录",
     codebuddyAccountUnknown: "状态未知",
     codebuddyAccountUnknownDesc: "无法确认系统凭据存储中的登录状态；若已在终端 /login，可直接使用",

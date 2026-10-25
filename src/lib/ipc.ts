@@ -1330,6 +1330,13 @@ export interface PetPackage extends PetSummary {
   frameCounts?: number[];
 }
 
+/** Native host and resolved shell behind a terminal PTY. Web-access clients
+ * must use this rather than their browser platform when quoting input. */
+export interface TerminalHostInfo {
+  platform: string;
+  shellPath: string;
+}
+
 export const ipc = {
   // config
   getCliConfig: () => invoke<CliConfig>("get_cli_config"),
@@ -1617,6 +1624,7 @@ export const ipc = {
   setWorkspaceGroup: (id: string, groupId: string | null) =>
     invoke<void>("set_workspace_group", { id, groupId }),
   // terminal
+  terminalHostInfo: () => invoke<TerminalHostInfo>("terminal_host_info"),
   /** Idempotent: re-opening a live session id is a no-op on the backend. */
   terminalOpen: (args: { id: string; cwd: string; cols: number; rows: number }) =>
     invoke<void>("terminal_open", args),

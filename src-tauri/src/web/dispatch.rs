@@ -1223,6 +1223,7 @@ pub(super) async fn dispatch(
             ser(crate::open_app::reveal_in_file_manager(a.path).await)
         }
         // terminal
+        "terminal_host_info" => ser(Ok(crate::terminal::terminal_host_info())),
         "terminal_open" => {
             let a: TerminalOpenArgs = parse_args(&raw)?;
             ser(crate::terminal::terminal_open(a.id, a.cwd, a.cols, a.rows, app.state()).await)

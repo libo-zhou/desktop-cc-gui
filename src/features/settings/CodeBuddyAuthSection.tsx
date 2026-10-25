@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useCallback, useEffect, useMemo, useState } from "react";
 import { useTranslation } from "react-i18next";
 import { useNavigate } from "react-router-dom";
 import LogIn from "lucide-react/dist/esm/icons/log-in";
@@ -19,42 +19,56 @@ interface AccountView {
   description: string;
 }
 
+// Navigation unmounts Settings. Keep the one-shot invalidation outside React
+// so the first probe after returning to this section bypasses the 30s cache.
+let forceNextProbe = false;
+
+function consumeForcedProbe(): boolean {
+  const force = forceNextProbe;
+  forceNextProbe = false;
+  return force;
+}
+
 export function CodeBuddyAuthSection() {
   const { t } = useTranslation();
   const navigate = useNavigate();
   const [status, setStatus] = useState<CodeBuddyAccountStatus | null>(null);
+  const [statusFailed, setStatusFailed] = useState(false);
   const [refreshing, setRefreshing] = useState(false);
   const [launching, setLaunching] = useState(false);
   const [notice, setNotice] = useState<string | null>(null);
-  // The probe result is cached server-side; after the interactive /login flow
-  // the next focus probe must bypass that cache or it reports the pre-login
-  // state for up to the TTL.
-  const forceNextProbe = useRef(false);
 
   const fetchStatus = useCallback(async (force = false) => {
     setRefreshing(true);
     try {
       setStatus(await ipc.codebuddyAccountStatus(force));
+      setStatusFailed(false);
     } catch {
       setStatus(null);
+      setStatusFailed(true);
     } finally {
       setRefreshing(false);
     }
   }, []);
 
   useEffect(() => {
-    void fetchStatus();
+    void fetchStatus(consumeForcedProbe());
     const onFocus = () => {
-      const force = forceNextProbe.current;
-      forceNextProbe.current = false;
-      void fetchStatus(force);
+      void fetchStatus(consumeForcedProbe());
     };
     window.addEventListener("focus", onFocus);
     return () => window.removeEventListener("focus", onFocus);
   }, [fetchStatus]);
 
   const account = useMemo<AccountView | null>(() => {
-    if (!status) return null; // probe pending / failed: say so, don't claim "not logged in"
+    if (statusFailed) {
+      return {
+        loggedIn: false,
+        title: t("settings.codebuddyAccountError"),
+        description: t("settings.codebuddyAccountErrorDesc"),
+      };
+    }
+    if (!status) return null; // probe pending: never claim "not logged in"
     if (!status.loggedIn) {
       // A negative probe is "unknown", not proof of being logged out: the
       // credential-store service names are guesses.
@@ -69,7 +83,7 @@ export function CodeBuddyAuthSection() {
       title: t("settings.codebuddyAccountLoggedIn"),
       description: t("settings.codebuddyAccountReady"),
     };
-  }, [status, t]);
+  }, [status, statusFailed, t]);
 
   // The CLI owns the interactive login flow: close the settings overlay so
   // the user sees the terminal the login runs in.
@@ -80,7 +94,7 @@ export function CodeBuddyAuthSection() {
     try {
       const result = await launchCodeBuddyLogin();
       if (result.ok) {
-        forceNextProbe.current = true;
+        forceNextProbe = true;
         navigate("/");
       } else {
         setNotice(

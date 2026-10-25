@@ -180,10 +180,18 @@ pub(super) fn apply_channel(
     let mut settings = serde_json::json!({ "env": overlay });
     // A stale top-level `model` in the user's native settings.json survives a
     // `--settings` merge (that is exactly how models/codebuddy.rs reads the
-    // configured default). Mirror the selected model into the overlay so a
-    // channel send cannot silently run the native account's model when the
-    // caller supplied one.
-    if let Some(model) = model.map(str::trim).filter(|m| !m.is_empty()) {
+    // configured default). Mirror the selected model, or the channel's own
+    // CODEBUDDY_MODEL when no request model was selected, into the overlay.
+    let model = model
+        .map(str::trim)
+        .filter(|m| !m.is_empty())
+        .or_else(|| {
+            env.get("CODEBUDDY_MODEL")
+                .map(String::as_str)
+                .map(str::trim)
+                .filter(|m| !m.is_empty())
+        });
+    if let Some(model) = model {
         settings["model"] = serde_json::Value::String(model.to_string());
     }
     stage_overlay(built, &settings, directory)
@@ -208,6 +216,18 @@ fn stage_private_json(
     prefix: &str,
     value: &serde_json::Value,
 ) -> Result<std::path::PathBuf, String> {
+    stage_private_json_with_writer(directory, prefix, value, |file, content| {
+        use std::io::Write;
+        file.write_all(content)
+    })
+}
+
+fn stage_private_json_with_writer(
+    directory: &std::path::Path,
+    prefix: &str,
+    value: &serde_json::Value,
+    write: impl FnOnce(&mut std::fs::File, &[u8]) -> std::io::Result<()>,
+) -> Result<std::path::PathBuf, String> {
     let content = serde_json::to_vec(value)
         .map_err(|_| format!("Cannot serialize CodeBuddy {prefix} settings"))?;
     std::fs::create_dir_all(directory)
@@ -223,9 +243,13 @@ fn stage_private_json(
     let mut file = options
         .open(&path)
         .map_err(|e| format!("create private CodeBuddy settings: {e}"))?;
-    use std::io::Write;
-    file.write_all(&content)
-        .map_err(|e| format!("write private CodeBuddy settings: {e}"))?;
+    if let Err(error) = write(&mut file, &content) {
+        // Close before removal so this also works on Windows. The original
+        // write error is more useful than a best-effort cleanup error.
+        drop(file);
+        let _ = std::fs::remove_file(&path);
+        return Err(format!("write private CodeBuddy settings: {error}"));
+    }
     Ok(path)
 }
 pub struct CodeBuddyEngine {
@@ -287,6 +311,20 @@ impl Engine for CodeBuddyEngine {
         // Files staged for this child (private settings / MCP config); removed
         // once the child exits, and swept at startup if the app dies mid-run.
         let mut cleanup_files: Vec<std::path::PathBuf> = Vec::new();
+        let allowed: Vec<&str> = req
+            .allowed_tools
+            .as_deref()
+            .map(|tools| {
+                tools
+                    .iter()
+                    .map(|t| t.trim())
+                    .filter(|t| !t.is_empty())
+                    .collect()
+            })
+            .unwrap_or_default();
+        if req.allowed_tools.is_some() && allowed.is_empty() {
+            return Err("tool constraints must not be empty".to_string());
+        }
 
         // MCP servers first: their pre-approved tool names must land in the
         // SAME --allowedTools emission as everything else — if the CLI treats
@@ -317,17 +355,6 @@ impl Engine for CodeBuddyEngine {
             cmd.arg("--mcp-config").arg(path);
         }
 
-        let allowed: Vec<&str> = req
-            .allowed_tools
-            .as_deref()
-            .map(|tools| {
-                tools
-                    .iter()
-                    .map(|t| t.trim())
-                    .filter(|t| !t.is_empty())
-                    .collect()
-            })
-            .unwrap_or_default();
         if !allowed.is_empty() {
             cmd.arg("--permission-mode");
             cmd.arg("plan");
@@ -451,7 +478,11 @@ impl Engine for CodeBuddyEngine {
             cmd.arg(session_id);
         }
 
-        let stdin_payload = images::claude_stdin_message(&req.prompt, &req.images, &req.workspace)?;
+        let stdin_payload = images::claude_stdin_message(&req.prompt, &req.images, &req.workspace)
+            .map_err(|error| {
+                super::cleanup_staged_files(&cleanup_files);
+                error
+            })?;
         Ok(BuiltCommand {
             command: cmd,
             stdin_payload: Some(stdin_payload),
@@ -490,6 +521,92 @@ mod tests {
             memory_bot: None,
             allowed_tools: None,
         }
+    }
+
+    struct ScratchHome {
+        dir: PathBuf,
+        previous_home: Option<std::ffi::OsString>,
+        previous_profile: Option<std::ffi::OsString>,
+        _lock: parking_lot::MutexGuard<'static, ()>,
+    }
+
+    impl ScratchHome {
+        fn new(tag: &str) -> Self {
+            let lock = crate::paths::HOME_ENV_LOCK.lock();
+            let dir = std::env::temp_dir().join(format!(
+                "ccgui-codebuddy-{tag}-{}",
+                uuid::Uuid::new_v4()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            let previous_home = std::env::var_os("HOME");
+            let previous_profile = std::env::var_os("USERPROFILE");
+            std::env::set_var("HOME", &dir);
+            std::env::set_var("USERPROFILE", &dir);
+            Self {
+                dir,
+                previous_home,
+                previous_profile,
+                _lock: lock,
+            }
+        }
+    }
+
+    impl Drop for ScratchHome {
+        fn drop(&mut self) {
+            match &self.previous_home {
+                Some(value) => std::env::set_var("HOME", value),
+                None => std::env::remove_var("HOME"),
+            }
+            match &self.previous_profile {
+                Some(value) => std::env::set_var("USERPROFILE", value),
+                None => std::env::remove_var("USERPROFILE"),
+            }
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    #[test]
+    fn failed_private_json_write_removes_the_partial_file() {
+        let dir = std::env::temp_dir().join(format!(
+            "ccgui-codebuddy-write-failure-{}",
+            uuid::Uuid::new_v4()
+        ));
+        let result = stage_private_json_with_writer(
+            &dir,
+            "channel",
+            &serde_json::json!({"env":{"CODEBUDDY_API_KEY":"secret"}}),
+            |file, content| {
+                use std::io::Write;
+                file.write_all(&content[..content.len() / 2])?;
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::WriteZero,
+                    "injected write failure",
+                ))
+            },
+        );
+        assert!(result.unwrap_err().contains("injected write failure"));
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 0);
+        std::fs::remove_dir(dir).unwrap();
+    }
+
+    #[test]
+    fn image_payload_failure_cleans_staged_mcp_config() {
+        let home = ScratchHome::new("image-cleanup");
+        let staging = home.dir.join(".ccgui-next/codebuddy-staging");
+        let mut req = sample_req();
+        req.computer_use = Some(true);
+        req.images = vec!["data:image/png;base64,not-valid-base64".to_string()];
+
+        let error = CodeBuddyEngine::new()
+            .build_command(&req, "codebuddy")
+            .err()
+            .expect("an invalid image must fail command construction");
+        assert!(error.contains("invalid base64"));
+        assert_eq!(
+            std::fs::read_dir(&staging).unwrap().count(),
+            0,
+            "the staged MCP config (including any overlay token) must not survive a failed launch"
+        );
     }
 
     #[test]
@@ -768,20 +885,15 @@ mod tests {
     }
 
     #[test]
-    fn blank_allowed_tools_falls_back_to_permission_mode() {
+    fn blank_allowed_tools_are_rejected_fail_closed() {
         let engine = CodeBuddyEngine::new();
         let mut req = sample_req();
         req.allowed_tools = Some(vec!["  ".to_string(), String::new()]);
-        let built = engine.build_command(&req, "codebuddy").unwrap();
-        let args: Vec<String> = built
-            .command
-            .as_std()
-            .get_args()
-            .map(|a| a.to_string_lossy().into_owned())
-            .collect();
-        assert!(!args.iter().any(|a| a == "--tools"));
-        assert!(args.iter().any(|a| a == "--permission-mode"));
-        assert!(args.iter().any(|a| a == "auto"));
+        let error = engine
+            .build_command(&req, "codebuddy")
+            .err()
+            .expect("a present but empty tool whitelist must be rejected");
+        assert_eq!(error, "tool constraints must not be empty");
     }
 
     #[test]
